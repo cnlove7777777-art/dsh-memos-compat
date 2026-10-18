@@ -238,6 +238,7 @@ describe("DshHistoryWorker synthetic lifecycle", () => {
     await first.start();
     await first.worker.waitForIdle();
     expect(first.core.importBundle).toHaveBeenCalledOnce();
+    expect(first.core.importBundle.mock.calls[0][0].traces![0]).toMatchObject({ priority: 0.5, value: 0 });
     expect(first.bridge.complete).toHaveBeenCalledOnce();
     const cursor = JSON.parse(await readFile(join(home, "dsh-history-cursors.json"), "utf8"));
     expect(Object.keys(cursor.files)).toHaveLength(1);

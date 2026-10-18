@@ -124,7 +124,7 @@ keyword-only, and `GET /api/v1/health` reports `embedder.available: false`.
 enabled state and execute its model and embedding tests. Core health reports
 client initialization; it does not prove a successful model request.
 
-## Shared history and Codex access (`2.0.16-dsh.4`)
+## Shared history and Codex access (`2.0.16-dsh.5`)
 
 DSH Settings -> 记忆插件 now includes a separate history section. Opt in to local
 Codex and DSH session roots and a recent window (default seven days). The queue

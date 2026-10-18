@@ -36,7 +36,7 @@ const SEARCH_TIMEOUT_MS = 10_000;
 const FETCH_TIMEOUT_MS = 5_000;
 
 const SERVER_NAME = "memos-local-memory";
-const SERVER_VERSION = "2.0.16-dsh.4";
+const SERVER_VERSION = "2.0.16-dsh.5";
 const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS = [
   "2025-06-18",

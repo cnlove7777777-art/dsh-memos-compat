@@ -249,7 +249,7 @@ export class DshHistoryWorker implements HistoryApi {
           ts: turn.ts, turnId: turn.ts, userText, agentText, summary: redactHistoryText(parsed.summary),
           tags: ["lightweight_memory", "history_backfill", `source:${turn.source}`, `source_session:${turn.sessionId}`,
             `source_ref:${turn.sourceRef}`, `refined_by:${route.provider}/${route.model}`],
-          toolCalls: [], value: 0, alpha: 0, priority: 0,
+          toolCalls: [], value: 0, alpha: 0, priority: 0.5,
         }] });
         if (!imported.imported && !await this.options.core.getTrace(id)) throw new Error("History import failed");
         this.status.imported += imported.imported;

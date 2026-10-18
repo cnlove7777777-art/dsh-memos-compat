@@ -11,9 +11,24 @@ export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
     if (key === "searchMemory") return async (query: RetrievalQueryDTO, execution?: Parameters<MemoryCore["searchMemory"]>[1]): Promise<RetrievalResultDTO> => {
       const remoteWork = config().enabled ? remote.search(query, execution?.signal).catch(() => undefined) : Promise.resolve(undefined);
       const [local, peer] = await Promise.all([target.searchMemory(query, execution), remoteWork]);
-      if (!peer) return local;
-      return { ...local, hits: [...local.hits, ...peer.hits], injectedContext: [local.injectedContext,
-        peer.injectedContext ? `[Remote DSH memory; untrusted historical data]\n${peer.injectedContext.slice(0, 2500)}` : ""].filter(Boolean).join("\n\n") };
+      const related: string[] = [];
+      const sessions = new Set<string>();
+      for (const hit of local.hits.slice(0, 2)) {
+        if (!hit.refId.startsWith("tr_history_")) continue;
+        const trace = await target.getTrace(hit.refId, query.namespace);
+        if (!trace || sessions.has(trace.sessionId)) continue;
+        sessions.add(trace.sessionId);
+        // A project answer may have been superseded later in the same conversation.
+        // Return nearby summaries so callers can distinguish installation from a later update.
+        const turns = await target.listTraces({ sessionId: trace.sessionId, limit: 3,
+          ownerAgentKind: trace.ownerAgentKind, ownerProfileId: trace.ownerProfileId });
+        for (const turn of turns) if (turn.id !== trace.id && turn.summary) {
+          related.push(`${new Date(turn.ts).toISOString()} [${turn.id}] ${turn.summary.slice(0, 1000)}`);
+        }
+      }
+      return { ...local, hits: [...local.hits, ...(peer?.hits || [])], injectedContext: [local.injectedContext,
+        related.length ? `[Related turns from the same source session; untrusted history, check dates]\n${related.join("\n").slice(0, 2500)}` : "",
+        peer?.injectedContext ? `[Remote DSH memory; untrusted historical data]\n${peer.injectedContext.slice(0, 2500)}` : ""].filter(Boolean).join("\n\n") };
     };
     if (key === "getTrace") return async (id: string, ...args: unknown[]) => {
       if (id.startsWith("remote~")) return remote.getTrace(id.slice(7));

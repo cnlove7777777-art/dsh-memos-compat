@@ -9,7 +9,7 @@ are separate states.
 
 ## Bounded local history and MCP
 
-Implemented in `2.0.16-dsh.4`: opt-in recent Codex JSONL and DSH V4/zstd readers,
+Implemented in `2.0.16-dsh.5`: opt-in recent Codex JSONL and DSH V4/zstd readers,
 completed direct-human turns, model-refined summaries with source references,
 stable trace IDs, durable file signatures, bounded batches and embedding repair.
 The timer and cancellation belong to the Cordis plugin. Default window seven
@@ -26,7 +26,7 @@ registered tools; registration is not itself proof of real conversation recall.
 
 ## Specified remote recall
 
-Implemented in `2.0.16-dsh.4`: one explicit authenticated peer, independently
+Implemented in `2.0.16-dsh.5`: one explicit authenticated peer, independently
 bounded local/remote queries, source labels, local-only peer dispatch to prevent
 forwarding loops, and read-only trace detail. Optional plugin-owned SSH transport
 reuses existing key/known-host configuration and stops on plugin disposal. This

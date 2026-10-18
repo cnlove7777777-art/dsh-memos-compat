@@ -19,8 +19,18 @@ describe("DSH shared memory", () => {
     const core = federateMemoryCore({ searchMemory } as unknown as MemoryCore,
       { search: remoteSearch } as never, () => ({ enabled: true, url: "", tokenFile: "" }));
     const signal = new AbortController().signal;
-    expect(await core.searchMemory(query, { signal })).toBe(local);
+    expect(await core.searchMemory(query, { signal })).toEqual(local);
     expect(remoteSearch).toHaveBeenCalledWith(query, signal);
+  });
+  it("includes later summaries from a matched history session to expose changed project facts", async () => {
+    const local = result("tr_history_install");
+    const core = federateMemoryCore({ searchMemory: vi.fn().mockResolvedValue(local),
+      getTrace: vi.fn().mockResolvedValue({ sessionId: "history:dsh:source", ownerProfileId: "standard" }),
+      listTraces: vi.fn().mockResolvedValue([{ id: "tr_history_update", ts: 1, summary: "The installed plugin was later updated to version 2" }]),
+    } as unknown as MemoryCore, {} as never, () => ({ enabled: false, url: "", tokenFile: "" }));
+    const found = await core.searchMemory(query);
+    expect(found.injectedContext).toContain("tr_history_update");
+    expect(found.injectedContext).toContain("later updated to version 2");
   });
   it("does not forward peer queries recursively and keeps credentials scoped", async () => {
     const root = await fs.mkdtemp(join(tmpdir(), "memos-peer-"));
