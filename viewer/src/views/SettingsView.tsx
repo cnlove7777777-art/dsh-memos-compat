@@ -13,13 +13,20 @@
  * server is back → reload the page.
  */
 import { useEffect, useState } from "preact/hooks";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { classifyModelTestFailure } from "../model-test-error";
 import { saveSettingsAndRestart } from "../settings-save";
 import { t, locale, setLocale } from "../stores/i18n";
 import { theme, setTheme } from "../stores/theme";
 import { health } from "../stores/health";
+import type { HealthPayload } from "../stores/health";
 import { Icon } from "../components/Icon";
+import {
+  DshMemorySettings,
+  type DshCapability,
+  type DshSettingsSnapshot,
+} from "../components/DshMemorySettings";
+import { classifyDshCapabilityFailure } from "../components/dsh-memory-settings-payload";
 import { HubAdminPanel } from "../components/HubAdminPanel";
 import {
   triggerRestart,
@@ -118,6 +125,9 @@ export function SettingsView({ initialTab }: { initialTab?: Tab } = {}) {
   const [dirty, setDirty] = useState<Partial<ResolvedConfig>>({});
   const [saving, setSaving] = useState<"idle" | "saving">("idle");
   const [error, setError] = useState<string | null>(null);
+  const [dshCapability, setDshCapability] = useState<DshCapability>({
+    status: "checking",
+  });
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -125,6 +135,53 @@ export function SettingsView({ initialTab }: { initialTab?: Tab } = {}) {
       .get<ResolvedConfig>("/api/v1/config", { signal: ctrl.signal })
       .then(setConfig)
       .catch(() => setConfig({}));
+    return () => ctrl.abort();
+  }, []);
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    api
+      .get<DshSettingsSnapshot>("/api/v1/dsh/settings", {
+        signal: ctrl.signal,
+      })
+      .then((snapshot) =>
+        setDshCapability({ status: "available", snapshot }),
+      )
+      .catch(async (err) => {
+        if (ctrl.signal.aborted) return;
+        let agent = health.value?.agent;
+        if (err instanceof ApiError && err.status === 404) {
+          try {
+            agent = (
+              await api.get<HealthPayload>("/api/v1/health", {
+                signal: ctrl.signal,
+              })
+            ).agent;
+          } catch (healthError) {
+            if (ctrl.signal.aborted) return;
+            setDshCapability({
+              status: "error",
+              message: errorText(healthError),
+            });
+            return;
+          }
+        }
+        const failure = classifyDshCapabilityFailure(
+          err instanceof ApiError ? err.status : undefined,
+          agent,
+        );
+        if (failure === "unavailable") {
+          setDshCapability({ status: "unavailable" });
+        } else {
+          setDshCapability({
+            status: "error",
+            message:
+              err instanceof ApiError && err.status === 404
+                ? "DSH 记忆模型设置接口返回 404。当前是 DSH 运行环境，不会回退到独立 Provider 的摘要/技能模型配置。"
+                : errorText(err),
+          });
+        }
+      });
     return () => ctrl.abort();
   }, []);
 
@@ -243,6 +300,10 @@ export function SettingsView({ initialTab }: { initialTab?: Tab } = {}) {
           embedding={(get("embedding") ?? {}) as ProviderBlock}
           llm={(get("llm") ?? {}) as ProviderBlock}
           skillEvolver={(get("skillEvolver") ?? {}) as ProviderBlock}
+          dshCapability={dshCapability}
+          onDshSnapshot={(snapshot) =>
+            setDshCapability({ status: "available", snapshot })
+          }
           onPatchEmbedding={(p) => patch("embedding", p)}
           onPatchLlm={(p) => patch("llm", p)}
           onPatchSkillEvolver={(p) => patch("skillEvolver", p)}
@@ -277,6 +338,8 @@ function ModelsTab({
   embedding,
   llm,
   skillEvolver,
+  dshCapability,
+  onDshSnapshot,
   onPatchEmbedding,
   onPatchLlm,
   onPatchSkillEvolver,
@@ -284,34 +347,14 @@ function ModelsTab({
   embedding: ProviderBlock;
   llm: ProviderBlock;
   skillEvolver: ProviderBlock;
+  dshCapability: DshCapability;
+  onDshSnapshot: (snapshot: DshSettingsSnapshot) => void;
   onPatchEmbedding: (p: Partial<ProviderBlock>) => void;
   onPatchLlm: (p: Partial<ProviderBlock>) => void;
   onPatchSkillEvolver: (p: Partial<ProviderBlock>) => void;
 }) {
   return (
     <div class="vstack" style="gap:var(--sp-5)">
-      <section
-        class="card card--flat"
-        style="border-left:3px solid var(--accent)"
-      >
-        <div class="hstack" style="gap:var(--sp-2);align-items:flex-start">
-          <Icon name="info" size={14} style="margin-top:3px;flex-shrink:0;color:var(--accent)" />
-          <div>
-            <h3
-              class="card__title"
-              style="font-size:var(--fs-md);margin:0 0 var(--sp-2) 0"
-            >
-              {t("settings.model.tip.title")}
-            </h3>
-            <ul style="margin:0;padding-left:18px;font-size:var(--fs-sm);line-height:1.7;color:var(--fg)">
-              <li>{t("settings.model.tip.embedding")}</li>
-              <li>{t("settings.model.tip.summarizer")}</li>
-              <li>{t("settings.model.tip.skillEvolver")}</li>
-            </ul>
-          </div>
-        </div>
-      </section>
-
       <ModelCard
         icon="plug"
         title={t("settings.embedding.title")}
@@ -323,27 +366,108 @@ function ModelsTab({
         onPatch={onPatchEmbedding}
       />
 
-      <ModelCard
-        icon="sparkles"
-        title={t("settings.summarizer.title")}
-        desc={t("settings.summarizer.desc")}
-        block={llm}
-        providers={LLM_PROVIDERS}
-        type="summarizer"
-        inheritsLabel={t("settings.summarizer.inherit")}
-        onPatch={onPatchLlm}
-      />
+      {dshCapability.status === "checking" && (
+        <section class="card card--flat">
+          <div class="hstack">
+            <Icon name="loader-2" size={16} class="spin" />
+            <span class="muted" style="font-size:var(--fs-sm)">
+              正在检查 DSH 记忆模型能力…
+            </span>
+          </div>
+        </section>
+      )}
 
-      <ModelCard
-        icon="wand-sparkles"
-        title={t("settings.skillEvolver.title")}
-        desc={t("settings.skillEvolver.desc")}
-        block={skillEvolver}
-        providers={SKILL_PROVIDERS}
-        type="skillEvolver"
-        inheritsLabel={t("settings.skillEvolver.inherit")}
-        onPatch={onPatchSkillEvolver}
-      />
+      {dshCapability.status === "available" && (
+        <DshMemorySettings
+          initial={dshCapability.snapshot}
+          onSnapshot={onDshSnapshot}
+        />
+      )}
+
+      {dshCapability.status === "error" && (
+        <section
+          class="card card--flat"
+          style="border-color:var(--danger)"
+          role="alert"
+        >
+          <div class="hstack" style="gap:var(--sp-2);align-items:flex-start">
+            <Icon
+              name="circle-alert"
+              size={16}
+              style="margin-top:2px;color:var(--danger);flex-shrink:0"
+            />
+            <div>
+              <h3
+                class="card__title"
+                style="font-size:var(--fs-md);margin:0 0 var(--sp-1) 0"
+              >
+                无法读取 DSH 记忆模型设置
+              </h3>
+              <p
+                class="card__subtitle"
+                style="margin:0;font-size:var(--fs-sm)"
+              >
+                {dshCapability.message}
+              </p>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {dshCapability.status === "unavailable" && (
+        <>
+          <section
+            class="card card--flat"
+            style="border-left:3px solid var(--accent)"
+          >
+            <div
+              class="hstack"
+              style="gap:var(--sp-2);align-items:flex-start"
+            >
+              <Icon
+                name="info"
+                size={14}
+                style="margin-top:3px;flex-shrink:0;color:var(--accent)"
+              />
+              <div>
+                <h3
+                  class="card__title"
+                  style="font-size:var(--fs-md);margin:0 0 var(--sp-2) 0"
+                >
+                  {t("settings.model.tip.title")}
+                </h3>
+                <ul style="margin:0;padding-left:18px;font-size:var(--fs-sm);line-height:1.7;color:var(--fg)">
+                  <li>{t("settings.model.tip.embedding")}</li>
+                  <li>{t("settings.model.tip.summarizer")}</li>
+                  <li>{t("settings.model.tip.skillEvolver")}</li>
+                </ul>
+              </div>
+            </div>
+          </section>
+
+          <ModelCard
+            icon="sparkles"
+            title={t("settings.summarizer.title")}
+            desc={t("settings.summarizer.desc")}
+            block={llm}
+            providers={LLM_PROVIDERS}
+            type="summarizer"
+            inheritsLabel={t("settings.summarizer.inherit")}
+            onPatch={onPatchLlm}
+          />
+
+          <ModelCard
+            icon="wand-sparkles"
+            title={t("settings.skillEvolver.title")}
+            desc={t("settings.skillEvolver.desc")}
+            block={skillEvolver}
+            providers={SKILL_PROVIDERS}
+            type="skillEvolver"
+            inheritsLabel={t("settings.skillEvolver.inherit")}
+            onPatch={onPatchSkillEvolver}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -1273,4 +1397,10 @@ function ToggleSwitch({
       />
     </button>
   );
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error && error.message
+    ? error.message
+    : String(error || "Unknown error");
 }

@@ -1,6 +1,6 @@
 {
   "name": "@memtensor/memos-local-plugin",
-  "version": "2.0.16-dsh.1",
+  "version": "2.0.16-dsh.2",
   "description": "Reflect2Evolve memory plugin: layered L1/L2/L3 memory, reflection-weighted value backprop, cross-task policy induction, skill crystallization, and three-tier retrieval for OpenClaw, Hermes Agent, and DeepSeek Harness.",
   "type": "module",
   "main": "dist/core/index.js",
@@ -16,6 +16,12 @@
   "dsh": {
     "bundle": {
       "patch": "./adapters/deepseek-harness/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "engines": {
@@ -56,12 +62,13 @@
     "!**/.gitkeep",
     "!**/*.map",
     "!dist/tests",
-    "!dist/tests/**"
+    "!dist/tests/**",
+    "docs/DSH-MEMORY-PLAN.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/copy-runtime-assets.cjs",
     "build:viewer": "vite build --config vite.config.ts",
-    "build:package": "npm run build && npm run build:viewer",
+    "build:package": "npm run build && npm run build:dsh-client && npm run build:viewer",
     "prepack": "npm run check:hermes-version && npm run build:package",
     "sync:hermes-version": "node scripts/sync-hermes-version.cjs",
     "check:hermes-version": "node scripts/sync-hermes-version.cjs --check",
@@ -76,7 +83,9 @@
     "test:integration": "vitest run tests/integration",
     "test:e2e": "vitest run tests/e2e",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "postinstall": "node scripts/postinstall.cjs"
+    "postinstall": "node scripts/postinstall.cjs",
+    "build:dsh-client": "node scripts/build-dsh-client.mjs",
+    "prepare": "npm run build:package"
   },
   "keywords": [
     "memory",
@@ -151,6 +160,17 @@
     "@types/uuid": "^10.0.0",
     "typescript": "^5.7.0",
     "vite": "^5.4.10",
-    "vitest": "^2.1.9"
+    "vitest": "^2.1.9",
+    "esbuild": "^0.27.7"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/core/index.d.ts",
+      "default": "./dist/core/index.js"
+    },
+    "./client": {
+      "default": "./dist/adapters/deepseek-harness/client.js"
+    },
+    "./*": "./*"
   }
 }

@@ -4,7 +4,7 @@
  * Wraps `fetch` with:
  *   - sensible defaults (JSON content-type, API-key propagation),
  *   - uniform error handling (surface `{error:{code,message}}` shape),
- *   - tiny helper surface: `get`, `post`, `del`.
+ *   - tiny helper surface: `get`, `post`, `put`, `patch`, `del`.
  */
 
 const DEFAULT_HEADERS: Record<string, string> = {
@@ -138,6 +138,8 @@ export const api = {
     request<T>("GET", path, undefined, opts),
   post: <T = unknown>(path: string, body?: unknown, opts?: { signal?: AbortSignal }) =>
     request<T>("POST", path, body, opts),
+  put: <T = unknown>(path: string, body?: unknown, opts?: { signal?: AbortSignal }) =>
+    request<T>("PUT", path, body, opts),
   patch: <T = unknown>(path: string, body?: unknown, opts?: { signal?: AbortSignal }) =>
     request<T>("PATCH", path, body, opts),
   del: <T = unknown>(path: string, opts?: { signal?: AbortSignal }) =>

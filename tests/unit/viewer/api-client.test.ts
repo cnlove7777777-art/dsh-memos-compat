@@ -79,6 +79,19 @@ describe("api (viewer REST client)", () => {
     expect((received?.headers as any)["x-api-key"]).toBe("hunter2");
   });
 
+  it("api.put preserves the JSON body and API-key contract", async () => {
+    (globalThis as any).localStorage.setItem("memos.apiKey", "hunter2");
+    let received: RequestInit | undefined;
+    globalThis.fetch = (async (_u: any, init: RequestInit) => {
+      received = init;
+      return okResponse({ ok: true });
+    }) as any;
+    await api.put("/api/v1/dsh/settings", { mode: "follow" });
+    expect(received?.method).toBe("PUT");
+    expect(JSON.parse(received?.body as string)).toEqual({ mode: "follow" });
+    expect((received?.headers as any)["x-api-key"]).toBe("hunter2");
+  });
+
   it("throws ApiError with code+message on non-2xx", async () => {
     globalThis.fetch = (async () =>
       okResponse(

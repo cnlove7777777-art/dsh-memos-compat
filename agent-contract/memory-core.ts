@@ -527,6 +527,8 @@ export interface MemoryCore {
    * comments). Returns the new masked config.
    */
   patchConfig(patch: Record<string, unknown>): Promise<Record<string, unknown>>;
+  /** Execute the active embedder, without writing memory records. */
+  probeEmbedding(): Promise<{ ok: true; dimensions: number; latencyMs: number }>;
 
   // ── optional Hub runtime hooks (HTTP viewer uses these when present) ──
   hubAdminSnapshot?(): Promise<unknown>;

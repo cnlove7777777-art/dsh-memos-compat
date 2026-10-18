@@ -109,6 +109,9 @@ export class DeepSeekHarnessLlmRouteContext {
 export interface CreateDeepSeekHarnessHostLlmBridgeOptions {
   readonly llm: DeepSeekHarnessLlmLike;
   readonly routes: DeepSeekHarnessLlmRouteContext;
+  /** Memory-specific selection; absent means follow the owning conversation. */
+  readonly resolveRoute?: () => DeepSeekHarnessLlmRoute | undefined;
+  readonly isEnabled?: () => boolean;
 }
 
 /**
@@ -126,12 +129,13 @@ export function createDeepSeekHarnessHostLlmBridge(
   };
   return {
     id: HOST_LLM_BRIDGE_ID,
+    isEnabled: options.isEnabled,
     invalidateModelCapabilities(): void {
       capabilityCache.generation++;
       capabilityCache.entries.clear();
     },
     async complete(input: HostLlmCompleteInput): Promise<HostLlmCompletion> {
-      const route = options.routes.current();
+      const route = options.resolveRoute ? options.resolveRoute() : options.routes.current();
       if (!route) {
         throw new MemosError(
           ERROR_CODES.LLM_UNAVAILABLE,

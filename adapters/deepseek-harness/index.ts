@@ -39,6 +39,8 @@ import {
   type DeepSeekHarnessHostLlmBridge,
 } from "./host-llm.js";
 import { registerDeepSeekHarnessTools } from "./tools.js";
+import { configureDshManagedModels, DshMemorySettings, type DshModelRegistry } from "./settings.js";
+import { registerMemorySettingsHttp, type SettingsConnectionContext } from "./settings-http.js";
 
 export const name = DEEPSEEK_HARNESS_PLUGIN;
 export const inject = ["systemPrompt", "tools", "llm"];
@@ -250,14 +252,16 @@ export async function apply(
     for (const warning of loaded.warnings) {
       ctx.logger.warn(`memos-local-memory: ${warning}`);
     }
-    const memoryConfig = configureDeepSeekHarnessHostLlm(
-      loaded.config,
-      config.hostLlmEnabled,
-    );
+    const memoryConfig = configureDshManagedModels(loaded.config);
     const routes = new DeepSeekHarnessLlmRouteContext();
-    const hostLlmBridge = config.hostLlmEnabled
-      ? createDeepSeekHarnessHostLlmBridge({ llm: ctx.llm, routes })
-      : null;
+    const settings = new DshMemorySettings({ home: home.root, enabled: config.hostLlmEnabled,
+      llm: ctx.llm as DshModelRegistry, routes, core: () => core!,
+      viewerUrl: () => viewer?.url });
+    await settings.load();
+    if (settings.configurationWarning()) ctx.logger.warn(`memos-local-memory: ${settings.configurationWarning()}`);
+    const hostLlmBridge = createDeepSeekHarnessHostLlmBridge({
+      llm: ctx.llm, routes, resolveRoute: () => settings.route(), isEnabled: () => settings.isEnabled(),
+    });
     if (hostLlmBridge) {
       registrations.push(registerDeepSeekHarnessHostLlmCapabilityInvalidation(
         ctx,
@@ -280,6 +284,7 @@ export async function apply(
       initLogging: false,
     });
     await core.init();
+    if (typeof ctx.inject === "function") registerMemorySettingsHttp(ctx as unknown as SettingsConnectionContext, settings);
 
     if (config.viewerEnabled) {
       const viewerHost = memoryConfig.viewer.bindHost;
@@ -287,6 +292,7 @@ export async function apply(
         {
           core: core!,
           home,
+          dshSettings: settings,
           logTail: () => memoryBuffer().tail({ limit: 200 }),
         },
         {

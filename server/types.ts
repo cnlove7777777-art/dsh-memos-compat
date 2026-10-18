@@ -77,6 +77,8 @@ export interface ServerHandle {
 }
 
 export interface ServerDeps {
+  /** Optional embedded DSH settings, shared with the native Settings section. */
+  dshSettings?: import("../adapters/deepseek-harness/settings.js").MemorySettingsApi;
   /** The core that answers every API call. */
   core: MemoryCore;
   /**

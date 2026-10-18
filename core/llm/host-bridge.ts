@@ -31,6 +31,8 @@ export interface HostLlmCompletion {
 export interface HostLlmBridge {
   /** Stable provider id the host reports (e.g. "openclaw.host.v1"). */
   readonly id: string;
+  /** Optional host-specific runtime switch, surfaced by core health. */
+  isEnabled?(): boolean;
 
   complete(input: HostLlmCompleteInput): Promise<HostLlmCompletion>;
 }

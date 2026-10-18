@@ -4799,6 +4799,18 @@ export function createMemoryCore(
     };
   }
 
+  async function probeEmbedding(): Promise<{ ok: true; dimensions: number; latencyMs: number }> {
+    ensureLive();
+    if (!handle.embedder) throw new MemosError("embedding_unavailable", "The active embedding model is unavailable");
+    const started = Date.now();
+    const vector = await handle.embedder.embedOne({ text: `MemOS model probe ${started}`, role: "document" });
+    if (!vector.length || !Array.from(vector).every(Number.isFinite) ||
+      vector.length !== handle.embedder.dimensions) {
+      throw new MemosError("verification_failed", "The active embedding model returned an invalid vector");
+    }
+    return { ok: true, dimensions: vector.length, latencyMs: Date.now() - started };
+  }
+
   async function ensureEmbeddingDimensionKnown(): Promise<void> {
     if (!handle.embedder || handle.embedder.dimensions > 0) return;
     try {
@@ -5276,6 +5288,7 @@ export function createMemoryCore(
     removeHubUser,
     getConfig,
     patchConfig,
+    probeEmbedding,
     metrics,
     exportBundle,
     importBundle,
@@ -6048,7 +6061,7 @@ function llmHealth(
   // a fresh authentication / model-name failure. Now the colour is
   // driven entirely by *this process's* facade activity.
   return {
-    available: true,
+    available: llm.provider !== "host" || getHostLlmBridge()?.isEnabled?.() !== false,
     provider: llm.provider,
     model: llm.model,
     lastOkAt: s.lastOkAt,
