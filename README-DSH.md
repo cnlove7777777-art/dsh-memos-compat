@@ -55,7 +55,7 @@ or from a packed tarball:
 
 ```sh
 npm pack
-dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.2.tgz
+dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.5.tgz
 ```
 
 DSH's plugin manager owns dependency installation and bundle registration.
@@ -94,6 +94,11 @@ Reopen DSH after installing/upgrading the package. Open DSH Settings and select
 **记忆插件**. The standalone `18801` page is the memory database Viewer; it is
 not DSH's installed-plugin inventory. New model selections do not require a
 host restart.
+
+When replacing an older manually patched upstream package, remove only its
+obsolete `@memtensor/memos-local-plugin@2.0.16` entry from `patchedDependencies`
+in the profile's pnpm policy. The compatibility fixes now live in this package;
+leaving the old patch can make a later upgrade fail with `ERR_PNPM_UNUSED_PATCH`.
 
 ### `better-sqlite3` and build approval
 
