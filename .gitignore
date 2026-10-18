@@ -26,3 +26,9 @@ AGENTS_*.md
 # git. Counters the repo-root `.gitignore`'s `!apps/**/*.json`
 # allow-rule.
 telemetry.credentials.json
+
+# Local test run output
+*-test.txt
+*-test2.txt
+pristine-test.txt
+compat-test*.txt

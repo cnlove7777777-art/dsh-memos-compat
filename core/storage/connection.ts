@@ -15,12 +15,19 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import BetterSqlite3 from "better-sqlite3";
+import type BetterSqlite3 from "better-sqlite3";
+
+import { loadSqliteDriver, type SqliteDriver } from "./drivers/index.js";
 
 import { rootLogger } from "../logger/index.js";
 import type { OpenDbOptions, StorageDb, StorageStmt } from "./types.js";
 
 const log = rootLogger.child({ channel: "storage" });
+
+/** Which engine opened the current handle; logged once at open time. */
+type SqliteEngine = "better-sqlite3" | "node:sqlite";
+
+let cachedEngine: SqliteEngine | undefined;
 
 export function openDb(opts: OpenDbOptions): StorageDb {
   const { filepath, agent } = opts;
@@ -34,10 +41,12 @@ export function openDb(opts: OpenDbOptions): StorageDb {
     fs.mkdirSync(path.dirname(filepath), { recursive: true });
   }
 
-  const raw = new BetterSqlite3(filepath, {
-    readonly,
-    fileMustExist: readonly ? true : false,
-  });
+  // `better-sqlite3` first, `node:sqlite` only when the prebuild cannot be
+  // loaded (DSH Desktop ships an Electron runtime whose ABI the installed
+  // better-sqlite3 binary does not match). See drivers/index.ts.
+  const driver: SqliteDriver = loadSqliteDriver();
+  const raw = driver.create(filepath, { readonly });
+  cachedEngine ??= driver.engine;
 
   // Log open with operational metadata; nothing sensitive.
   log.info("sqlite.open", { filepath, agent, readonly, wal, busyTimeoutMs });

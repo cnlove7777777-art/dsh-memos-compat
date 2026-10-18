@@ -6,6 +6,9 @@ const { pipelineMock } = vi.hoisted(() => ({
 
 vi.mock("@huggingface/transformers", () => ({
   pipeline: pipelineMock,
+  // The provider pins the loader to the local cache before building the
+  // pipeline; a mock without `env` makes that property access throw.
+  env: { allowRemoteModels: true, allowLocalModels: true },
 }));
 
 import {

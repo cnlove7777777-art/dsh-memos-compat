@@ -17,6 +17,12 @@ import type {
   ProviderCallCtx,
 } from "../types.js";
 
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join, resolve } from "node:path";
+
+const require = createRequire(import.meta.url);
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Extractor = (text: string, options?: Record<string, unknown>) => Promise<any>;
 
@@ -59,6 +65,42 @@ function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T
   });
 }
 
+/**
+ * Resolve a directory that already holds the model, so an offline install
+ * works without reaching the network.
+ *
+ * `@huggingface/transformers` looks in `env.localModelPath` first and then in
+ * `env.cacheDir`; both default to paths beside the package itself. A plugin
+ * installed into a DSH profile keeps its model wherever the profile staged
+ * it, so check the well-known locations before giving up and letting the
+ * loader try the network.
+ */
+export function resolveLocalModelRootForTests(model: string): string | undefined {
+  return resolveLocalModelRoot(model);
+}
+
+function resolveLocalModelRoot(model: string): string | undefined {
+  const relative = model.split("/").join("/");
+  // Resolve through a real subpath export, not `package.json`: the package's
+  // `exports` map does not expose `./package.json`, and `require.resolve`
+  // throws rather than returning null.
+  const packageDir = dirname(require.resolve("@huggingface/transformers"));
+  const candidates = [
+    // Explicit override, for profiles that stage the model elsewhere.
+    process.env["MEMOS_LOCAL_MODEL_ROOT"],
+    // `<plugin>/node_modules/@huggingface/transformers/.cache` — where the
+    // DSH installer stages the quantized MiniLM files.
+    join(packageDir, ".cache"),
+    // `<plugin>/.cache` — a profile-local staging directory.
+    resolve(packageDir, "..", "..", "..", ".cache"),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (existsSync(join(candidate, relative))) return candidate;
+  }
+  return undefined;
+}
+
 async function ensureExtractor(model: string, log: ProviderCallCtx["log"]): Promise<Extractor> {
   if (extractorPromise && currentModel === model) return extractorPromise;
   if (extractorPromise && currentModel && currentModel !== model) {
@@ -72,6 +114,25 @@ async function ensureExtractor(model: string, log: ProviderCallCtx["log"]): Prom
     // don't need it.
     const mod = await import("@huggingface/transformers");
     const pipeline = (mod as unknown as { pipeline: PipelineFn }).pipeline;
+    // Offline-first: never reach out to huggingface.co from a plugin that
+    // runs inside someone's chat client. Models are expected to be present
+    // in the local cache; `MEMOS_OFFLINE_MODELS=0` re-enables remote fetch
+    // for users who explicitly want it.
+    const offline = (process.env["MEMOS_OFFLINE_MODELS"] ?? "1") !== "0";
+    const env = (mod as unknown as { env?: Record<string, unknown> }).env;
+    if (offline && env && typeof env === "object") {
+      env.allowRemoteModels = false;
+      env.allowLocalModels = true;
+      // Point the loader at a directory that actually holds the model. Without
+      // this the offline load fails on `models/` even when the files are
+      // staged one directory over.
+      const localRoot = resolveLocalModelRoot(model);
+      if (localRoot) {
+        env.localModelPath = localRoot;
+        env.cacheDir = localRoot;
+        log.info("offline", { root: localRoot });
+      }
+    }
     const ext = (await pipeline("feature-extraction", model, {
       dtype: "q8",
       device: "cpu",

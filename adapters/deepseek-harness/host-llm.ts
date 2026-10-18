@@ -366,7 +366,9 @@ function toDshMessage(
   if (message.role === "user") {
     return createUserMessage({
       content,
-      source: { kind: "plugin", plugin: HOST_LLM_MESSAGE_SOURCE },
+      // DSH Session V4 retired the `kind: "plugin"` wrapper and requires a
+      // producer-owned source kind.
+      source: { kind: `plugin:${HOST_LLM_MESSAGE_SOURCE}` },
     });
   }
   return createAssistantMessage({

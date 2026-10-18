@@ -387,8 +387,9 @@ export async function apply(
       createRecallMessage: (text) => createUserMessage({
         content: [{ type: "text", text }],
         source: {
-          kind: "plugin",
-          plugin: DEEPSEEK_HARNESS_PLUGIN,
+          // DSH Session V4 retired the `kind: "plugin"` wrapper and requires a
+          // producer-owned source kind.
+          kind: `plugin:${DEEPSEEK_HARNESS_PLUGIN}`,
           form: "recall",
         },
       }) as unknown as DshUserMessageLike,
