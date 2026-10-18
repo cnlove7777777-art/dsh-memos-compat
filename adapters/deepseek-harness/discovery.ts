@@ -183,6 +183,7 @@ export class PeerDiscovery {
     this.pendingProbes.clear();
     this.seenMessages.clear();
     this.candidates.clear();
+    this.targets = [];
 
     const task = this.stopOwned();
     this.stopTask = task;
@@ -284,6 +285,21 @@ export class PeerDiscovery {
       if (this.socket !== socket) return;
       void this.handleMessage(message, remote, generation);
     };
+    const errorHandler = (): void => {
+      if (this.socket !== socket) return;
+      this.socket = undefined;
+      this.socketMessageHandler = undefined;
+      this.socketErrorHandler = undefined;
+      this.joinedInterfaces.clear();
+      this.nextBindAttemptAt = this.now() + REBIND_BACKOFF_MS;
+      socket.removeListener("message", messageHandler);
+      socket.removeListener("error", errorHandler);
+      try {
+        socket.close();
+      } catch {
+        // The failed socket may already be closed.
+      }
+    };
     try {
       await new Promise<void>((resolve, reject) => {
         const onListening = (): void => {
@@ -323,9 +339,9 @@ export class PeerDiscovery {
 
     this.socket = socket;
     this.socketMessageHandler = messageHandler;
-    this.socketErrorHandler = () => undefined;
+    this.socketErrorHandler = errorHandler;
     socket.on("message", messageHandler);
-    // Runtime errors are non-fatal: stop() still owns the socket lifecycle.
+    // Runtime errors degrade to a retry on a later scan.
     socket.on("error", this.socketErrorHandler);
     socket.unref?.();
 
@@ -380,6 +396,7 @@ export class PeerDiscovery {
     this.limitPendingProbes();
 
     for (const target of this.targets) {
+      if (!this.running || generation !== this.generation) return;
       try {
         socket.setMulticastInterface(target.address);
       } catch {
