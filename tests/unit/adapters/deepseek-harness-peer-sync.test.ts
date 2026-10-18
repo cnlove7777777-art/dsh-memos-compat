@@ -2,9 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import Database from "better-sqlite3";
 
 import { makeRepos, openDb, runMigrations, type Repos, type StorageDb } from "../../../core/storage/index.js";
+import {
+  loadSqliteDriver,
+  resetSqliteDriverCache,
+} from "../../../core/storage/drivers/index.js";
 import {
   PeerSyncStore,
   PEER_SYNC_MAX_PAGE_ITEMS,
@@ -329,7 +332,7 @@ describe("PeerSyncStore", () => {
   it("skips absent source tables safely and enforces bounded page sizes", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "memos-peer-empty-"));
     const sourcePath = path.join(root, "memos.db");
-    const db = new Database(sourcePath);
+    const db = openDb({ filepath: sourcePath, agent: "deepseek-harness" });
     db.exec("CREATE TABLE kv (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)");
     cleanups.push(() => {
       db.close();
@@ -341,5 +344,35 @@ describe("PeerSyncStore", () => {
     expect(store.exportPage()).toMatchObject({ protocol: PEER_SYNC_PROTOCOL, done: true, items: [] });
     expect(store.stats().source).toEqual({ trace: 0, policy: 0, world_model: 0, skill: 0 });
     expect(() => store.exportPage({ limit: 0 })).not.toThrow();
+  });
+
+  it("runs export and import through the node:sqlite fallback", () => {
+    const previous = process.env["MEMOS_SQLITE_DRIVER"];
+    process.env["MEMOS_SQLITE_DRIVER"] = "node:sqlite";
+    resetSqliteDriverCache();
+    cleanups.push(() => {
+      if (previous === undefined) delete process.env["MEMOS_SQLITE_DRIVER"];
+      else process.env["MEMOS_SQLITE_DRIVER"] = previous;
+      resetSqliteDriverCache();
+    });
+    expect(loadSqliteDriver().engine).toBe("node:sqlite");
+    const f = fixture();
+    seedTrace(f);
+    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-fallback" });
+    cleanups.push(() => store.close());
+    store.open();
+    const page = store.exportPage({ limit: 20 });
+    expect(page.items.some((item) => item.id === "trace-1")).toBe(true);
+    expect(store.importPage({
+      protocol: PEER_SYNC_PROTOCOL,
+      nodeId: "node-peer",
+      done: true,
+      items: page.items.map((item) => ({
+        ...item,
+        id: `${item.id}-mirror`,
+        revision: `${item.revision}-mirror`,
+      })),
+    }, "node-peer").inserted).toBeGreaterThan(0);
+    expect(store.stats().replicas.trace).toBeGreaterThan(0);
   });
 });

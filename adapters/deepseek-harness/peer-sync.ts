@@ -13,9 +13,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import Database from "better-sqlite3";
-
 import type { RetrievalHitDTO, TraceDTO } from "../../agent-contract/dto.js";
+import { openDb, type StorageDb } from "../../core/storage/index.js";
 
 export const PEER_SYNC_PROTOCOL = "saya-memory-sync/1" as const;
 export const PEER_SYNC_MAX_PAGE_ITEMS = 50;
@@ -247,8 +246,8 @@ const ABSOLUTE_PATH =
 const SEARCH_SCAN_LIMIT = 2_000;
 
 export class PeerSyncStore {
-  private source?: Database.Database;
-  private replica?: Database.Database;
+  private source?: StorageDb;
+  private replica?: StorageDb;
   private sourceTables = new Set<string>();
   private readonly replicaPath: string;
 
@@ -264,15 +263,11 @@ export class PeerSyncStore {
     if (!fs.existsSync(this.options.dbPath)) {
       throw new Error("PeerSync source database does not exist");
     }
-    const source = new Database(this.options.dbPath, { readonly: true, fileMustExist: true });
-    let replica: Database.Database | undefined;
+    const source = openDb({ filepath: this.options.dbPath, agent: "deepseek-harness", readonly: true });
+    let replica: StorageDb | undefined;
     try {
       fs.mkdirSync(path.dirname(this.replicaPath), { recursive: true });
-      replica = new Database(this.replicaPath);
-      replica.pragma("journal_mode = WAL");
-      replica.pragma("synchronous = NORMAL");
-      replica.pragma("foreign_keys = ON");
-      replica.pragma("busy_timeout = 5000");
+      replica = openDb({ filepath: this.replicaPath, agent: "deepseek-harness", busyTimeoutMs: 5000 });
       this.installReplicaSchema(replica);
       this.source = source;
       this.replica = replica;
@@ -449,9 +444,9 @@ export class PeerSyncStore {
       "SELECT revision FROM peer_items WHERE origin_node = ? AND kind = ? AND id = ?",
     );
     const result = { inserted: 0, updated: 0, skipped: 0 };
-    replica.transaction(() => {
+    replica.tx(() => {
       for (const item of validated.items) {
-        const previous = exists.get(validated.originNode, item.kind, item.id) as
+        const previous = exists.get([validated.originNode, item.kind, item.id]) as
           | { revision: string }
           | undefined;
         const payload = JSON.stringify(sanitizeForWire(item.payload));
@@ -470,7 +465,7 @@ export class PeerSyncStore {
         else if (run.changes > 0) result.updated++;
         else result.skipped++;
       }
-    })();
+    });
     return result;
   }
 
@@ -578,7 +573,7 @@ export class PeerSyncStore {
     }
     for (const row of replica
       .prepare("SELECT * FROM peer_items ORDER BY imported_at DESC LIMIT ?")
-      .all(SEARCH_SCAN_LIMIT) as ReplicaRow[]) {
+      .all([SEARCH_SCAN_LIMIT]) as ReplicaRow[]) {
       const payload = parseJsonObject(row.payload_json);
       const score = lexicalScore(query, payload);
       if (score <= 0) continue;
@@ -611,7 +606,7 @@ export class PeerSyncStore {
     }
     const vectors = replica
       .prepare("SELECT * FROM peer_vectors WHERE model = ? AND dimension = ? LIMIT ?")
-      .all(query.model, query.values.length, SEARCH_SCAN_LIMIT) as Array<{
+      .all([query.model, query.values.length, SEARCH_SCAN_LIMIT]) as Array<{
         origin_node: string;
         kind: PeerSyncKind;
         item_id: string;
@@ -626,7 +621,7 @@ export class PeerSyncStore {
       if (score <= 0) continue;
       const item = replica
         .prepare("SELECT payload_json FROM peer_items WHERE origin_node = ? AND kind = ? AND id = ?")
-        .get(vector.origin_node, vector.kind, vector.item_id) as { payload_json: string } | undefined;
+        .get([vector.origin_node, vector.kind, vector.item_id]) as { payload_json: string } | undefined;
       if (!item) continue;
       const hit = this.hit(
         "replica",
@@ -669,7 +664,7 @@ export class PeerSyncStore {
     const row = (nodeId
       ? replica
           .prepare("SELECT * FROM peer_items WHERE origin_node = ? AND kind = 'trace' AND id = ?")
-          .get(nodeId, id)
+          .get([nodeId, id])
       : replica
           .prepare("SELECT * FROM peer_items WHERE kind = 'trace' AND id = ? ORDER BY imported_at DESC LIMIT 1")
           .get(id)) as ReplicaRow | undefined;
@@ -717,18 +712,18 @@ export class PeerSyncStore {
     };
   }
 
-  private requireSource(): Database.Database {
+  private requireSource(): StorageDb {
     if (!this.source) throw new Error("PeerSyncStore is not open");
     return this.source;
   }
 
-  private requireReplica(): Database.Database {
+  private requireReplica(): StorageDb {
     if (!this.replica) throw new Error("PeerSyncStore is not open");
     return this.replica;
   }
 
   private hasExportCandidatesAfter(
-    source: Database.Database,
+    source: StorageDb,
     cursor: { updated_at: number; kind: PeerSyncKind; id: string },
   ): boolean {
     for (const spec of TABLE_SPECS) {
@@ -764,7 +759,7 @@ export class PeerSyncStore {
   }
 
   private collectRevisionCandidates(
-    source: Database.Database,
+    source: StorageDb,
     candidates: CandidateRow[],
     limit: number,
   ): void {
@@ -813,7 +808,7 @@ export class PeerSyncStore {
     candidates.sort(compareCandidates);
   }
 
-  private installReplicaSchema(db: Database.Database): void {
+  private installReplicaSchema(db: StorageDb): void {
     db.exec(`
       CREATE TABLE IF NOT EXISTS peer_items (
         origin_node TEXT NOT NULL,
