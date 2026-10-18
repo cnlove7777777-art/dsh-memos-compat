@@ -124,7 +124,7 @@ keyword-only, and `GET /api/v1/health` reports `embedder.available: false`.
 enabled state and execute its model and embedding tests. Core health reports
 client initialization; it does not prove a successful model request.
 
-## Shared history and Codex access (`2.0.16-dsh.3`)
+## Shared history and Codex access (`2.0.16-dsh.4`)
 
 DSH Settings -> 记忆插件 now includes a separate history section. Opt in to local
 Codex and DSH session roots and a recent window (default seven days). The queue
@@ -168,7 +168,7 @@ An optional existing SSH settings file (`identity`, `known_hosts`,
 `last_address`, optional `username`) lets the plugin own the paired transport.
 It preserves host-key checking and never scans the network. The SSH child is
 only transport and stops with the plugin; no OS task or memory daemon is added.
-The paired NanoPi transport uses local forward 18794 -> server 18791 and reverse
+The paired NanoPi transport uses local forward 18794 -> server 18801 and reverse
 forward server 18793 -> this Viewer's port. Disable the old standalone connector
 before handing these ports to the plugin.
 

@@ -501,7 +501,7 @@ describe("DshRemoteMemory", () => {
       "-o", `UserKnownHostsFile=${join(home, "private", "known_hosts")}`,
       "-o", "HostKeyAlias=nanopi-m4v2",
       "-i", join(home, "private", "id_ed25519"),
-      "-L", "127.0.0.1:18794:127.0.0.1:18791",
+      "-L", "127.0.0.1:18794:127.0.0.1:18801",
       "-R", "127.0.0.1:18793:127.0.0.1:18801",
       "root@192.0.2.1",
     ]);

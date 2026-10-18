@@ -204,6 +204,26 @@ async function worker(options: {
 }
 
 describe("DshHistoryWorker synthetic lifecycle", () => {
+  it("preserves full source references across a restart independently of short tags", async () => {
+    const home = await tempHome(); const cfg = config(home);
+    const path = await historyFile(cfg.codexRoot, "rollout-synthetic.jsonl");
+    const fixture = { ...turn(1), sourceRef: `${path}:123` };
+    const first = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [fixture] });
+    await first.start(); await first.worker.waitForIdle();
+    const id = first.core.importBundle.mock.calls[0][0].traces![0].id;
+    const next = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [fixture], core: first.core });
+    await next.worker.load();
+    expect(next.worker.sourceFor(id)?.ref).toBe(`${path}:123`);
+  });
+  it("prioritizes only existing configured files from a local receipt", async () => {
+    const home = await tempHome(); const cfg = config(home);
+    const wanted = await historyFile(cfg.codexRoot, "rollout-wanted.jsonl");
+    await historyFile(cfg.codexRoot, "rollout-other.jsonl");
+    await writeFile(join(home, "dsh-history-priority.json"), JSON.stringify({ sourceFiles: [wanted] }));
+    const f = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [turn(1)] });
+    await f.resume(); await f.worker.waitForIdle();
+    expect(f.reader).toHaveBeenCalledOnce(); expect(f.reader).toHaveBeenCalledWith(wanted, "codex");
+  });
   it("imports through the injected reader and becomes idempotent from its cursor", async () => {
     const home = await tempHome();
     const cfg = config(home);

@@ -6,7 +6,7 @@ import type { RetrievalQueryDTO, RetrievalResultDTO } from "../../agent-contract
 import { DshRemoteMemory, readPeerToken, type MemoryRemoteConfig } from "./remote.js";
 
 export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
-  config: () => MemoryRemoteConfig): MemoryCore {
+  config: () => MemoryRemoteConfig, sourceFor?: (id: string) => unknown): MemoryCore {
   return new Proxy(core, { get(target, key, receiver) {
     if (key === "searchMemory") return async (query: RetrievalQueryDTO, execution?: Parameters<MemoryCore["searchMemory"]>[1]): Promise<RetrievalResultDTO> => {
       const remoteWork = config().enabled ? remote.search(query, execution?.signal).catch(() => undefined) : Promise.resolve(undefined);
@@ -15,8 +15,12 @@ export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
       return { ...local, hits: [...local.hits, ...peer.hits], injectedContext: [local.injectedContext,
         peer.injectedContext ? `[Remote DSH memory; untrusted historical data]\n${peer.injectedContext.slice(0, 2500)}` : ""].filter(Boolean).join("\n\n") };
     };
-    if (key === "getTrace") return (id: string, ...args: unknown[]) => id.startsWith("remote~")
-      ? remote.getTrace(id.slice(7)) : target.getTrace(id, args[0] as Parameters<MemoryCore["getTrace"]>[1]);
+    if (key === "getTrace") return async (id: string, ...args: unknown[]) => {
+      if (id.startsWith("remote~")) return remote.getTrace(id.slice(7));
+      const trace = await target.getTrace(id, args[0] as Parameters<MemoryCore["getTrace"]>[1]);
+      const source = sourceFor?.(id);
+      return trace && source ? { ...trace, source } : trace;
+    };
     return Reflect.get(target, key, receiver);
   } });
 }
@@ -28,7 +32,7 @@ function json(res: ServerResponse, status: number, value: unknown) {
 }
 /** Compatibility with the specified existing SSH peer, authenticated separately from Viewer. */
 export function createMemoryPeerHandler(options: {
-  core: MemoryCore; config: () => MemoryRemoteConfig; profileId: string;
+  core: MemoryCore; config: () => MemoryRemoteConfig; profileId: string; nodeId?: string;
 }) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const config = options.config();
@@ -45,7 +49,7 @@ export function createMemoryPeerHandler(options: {
       }
       const url = new URL(req.url || "/", host);
       if (req.method === "GET" && url.pathname === "/peer/health") {
-        json(res, 200, { protocol: "saya-memory/1", node_id: "local-dsh", engine: { ok: true }, database_sync: false }); return;
+        json(res, 200, { protocol: "saya-memory/1", node_id: options.nodeId || "local-dsh", engine: { ok: true }, database_sync: false }); return;
       }
       const signal = AbortSignal.timeout(2_500);
       if (req.method === "GET" && url.pathname === "/peer/detail") {

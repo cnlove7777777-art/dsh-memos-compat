@@ -153,7 +153,7 @@ export function DshHistorySettings({
       setCapability("available");
       setNotice({
         kind: "ok",
-        text: "历史互通设置已保存。需要立即导入时请单独运行一次。",
+        text: "历史互通设置已保存；启用时会自动开始整理。",
       });
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
@@ -299,7 +299,7 @@ export function DshHistorySettings({
             启用历史互通
           </span>
           <span class="muted" style="display:block;font-size:var(--fs-xs);line-height:1.6">
-            启用只影响配置，不会自动导入；保存后仍需点击运行。
+            保存启用后会自动整理，每分钟检查一次；也可手动运行。
           </span>
         </span>
       </label>

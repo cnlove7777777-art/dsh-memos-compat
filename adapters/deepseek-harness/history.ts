@@ -97,6 +97,7 @@ export class DshHistoryWorker implements HistoryApi {
   private stopped = false;
   private writes: Promise<unknown> = Promise.resolve();
   private priorityPaths?: Set<string>;
+  private sources: Record<string, { source: string; sessionId: string; ref: string; ts: number; model?: string }> = {};
   constructor(private readonly options: {
     home: string; profileId: string; core: MemoryCore; bridge: HostLlmBridge;
     route: () => DeepSeekHarnessLlmRoute | undefined;
@@ -121,7 +122,18 @@ export class DshHistoryWorker implements HistoryApi {
       const saved = JSON.parse(await fs.readFile(join(this.options.home, "dsh-history-cursors.json"), "utf8"));
       if (saved.version === 1 && saved.files && typeof saved.files === "object") this.cursors = saved.files;
     } catch { /* Stable trace IDs provide deduplication if a cursor receipt is lost. */ }
+    try {
+      const saved = JSON.parse(await fs.readFile(join(this.options.home, "dsh-history-sources.json"), "utf8"));
+      if (saved.version === 1 && saved.sources && typeof saved.sources === "object") this.sources = saved.sources;
+    } catch { /* Source receipts can be recovered by rereading original histories. */ }
+    try {
+      const saved = JSON.parse(await fs.readFile(join(this.options.home, "dsh-history-priority.json"), "utf8"));
+      if (Array.isArray(saved.sourceFiles) && saved.sourceFiles.length <= 4 && saved.sourceFiles.every((p: unknown) => typeof p === "string")) {
+        this.priorityPaths = new Set(saved.sourceFiles.map((p: string) => resolve(p)));
+      }
+    } catch { /* An absent optional local validation queue is normal. */ }
   }
+  sourceFor(id: string) { return this.sources[id]; }
   start(): void {
     if (this.timer || this.stopped || !this.config.enabled) return;
     this.timer = setInterval(() => { void this.run(); }, 60_000);
@@ -192,6 +204,11 @@ export class DshHistoryWorker implements HistoryApi {
     // Explicit validation runs may prioritize existing files, never escape the configured roots/window.
     const files = (await discoverHistoryFiles(config, cutoff)).filter(file => !priority || priority.has(file.path));
     files.sort((a, b) => (this.cursors[a.path]?.checkedAt || 0) - (this.cursors[b.path]?.checkedAt || 0) || b.mtime - a.mtime);
+    // Admit both sources before spending the remaining budget on the newest backlog.
+    const firstDsh = files.findIndex(file => file.source === "dsh");
+    const firstCodex = files.findIndex(file => file.source === "codex");
+    if (firstDsh >= 0 && firstCodex >= 0 && firstDsh > 1) files.splice(1, 0, files.splice(firstDsh, 1)[0]);
+    else if (firstDsh >= 0 && firstCodex > 1) files.splice(1, 0, files.splice(firstCodex, 1)[0]);
     let budget = this.options.maxTurns ?? 12;
     for (const file of files.slice(0, 40)) {
       signal.throwIfAborted();
@@ -199,12 +216,20 @@ export class DshHistoryWorker implements HistoryApi {
       if (cursor?.size === file.size && cursor.mtime === file.mtime) continue;
       const turns = await (this.options.reader || readHistoryFile)(file.path, file.source);
       let complete = true;
+      let sourceDirty = false;
+      let fileBudget = Math.min(6, budget);
       for (const turn of turns.filter(turn => turn.ts >= cutoff)) {
         signal.throwIfAborted();
         const id = historyTraceId(turn);
+        if (!this.sources[id]) {
+          this.sources[id] = { source: turn.source, sessionId: turn.sessionId, ref: turn.sourceRef,
+            ts: turn.ts, model: `${route.provider}/${route.model}` };
+          sourceDirty = true;
+        }
         if (await this.options.core.getTrace(id)) { this.status.skipped++; continue; }
-        if (budget <= 0) { complete = false; break; }
+        if (budget <= 0 || fileBudget <= 0) { complete = false; break; }
         budget--;
+        fileBudget--;
         const userText = redactHistoryText(turn.userText).slice(0, 12_000);
         const agentText = redactHistoryText(turn.agentText).slice(0, 18_000);
         const result = await this.options.withRoute(route, () => this.options.bridge.complete({
@@ -229,6 +254,7 @@ export class DshHistoryWorker implements HistoryApi {
         if (!imported.imported && !await this.options.core.getTrace(id)) throw new Error("History import failed");
         this.status.imported += imported.imported;
       }
+      if (sourceDirty) await atomicHistoryJson(join(this.options.home, "dsh-history-sources.json"), { version: 1, sources: this.sources });
       if (complete) this.cursors[file.path] = { size: file.size, mtime: file.mtime, checkedAt: Date.now() };
       await atomicHistoryJson(join(this.options.home, "dsh-history-cursors.json"), { version: 1, files: this.cursors });
       if (budget <= 0) break;
@@ -237,6 +263,7 @@ export class DshHistoryWorker implements HistoryApi {
     // Import intentionally omits vectors. Repair a bounded batch with the same active embedder.
     const repair = await this.options.core.rebuildEmbeddings({ mode: "repair", limit: 24 });
     if (repair.failed || !repair.statsAfter.available) throw new Error("History embedding repair failed");
+    if (priority) await fs.rm(join(this.options.home, "dsh-history-priority.json"), { force: true });
   }
 }
 

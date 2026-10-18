@@ -48,7 +48,7 @@ const LOCAL_NODE_ID = "local-dsh";
 const TUNNEL_HOST = "127.0.0.1";
 const LOCAL_FORWARD_PORT = 18_794;
 const REMOTE_FORWARD_PORT = 18_793;
-const REMOTE_LOCAL_PORT = 18_791;
+const REMOTE_LOCAL_PORT = 18_801;
 
 type JsonObject = Record<string, unknown>;
 

@@ -98,6 +98,81 @@ describe("Codex history reader", () => {
     expect(turns[0].turnKey).toMatch(/^codex:session-codex-synthetic:\d+:[0-9a-f]{16}$/);
   });
 
+  it("excludes a delegated child even when it contains user/final rows", () => {
+    const text = [
+      codexLine({
+        type: "session_meta",
+        payload: {
+          id: "synthetic-child",
+          session_id: "synthetic-parent",
+          thread_source: "subagent",
+          parent_thread_id: "synthetic-parent",
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: "synthetic-parent",
+                depth: 1,
+                agent_path: null,
+                agent_nickname: "Synthetic",
+                agent_role: null,
+              },
+            },
+          },
+          cwd: "/synthetic",
+        },
+      }),
+      codexLine(codexMessage("user", [
+        { type: "input_text", text: "delegated child task" },
+      ])),
+      codexLine(codexMessage("assistant", [
+        { type: "output_text", text: "delegated child final" },
+      ], "final_answer")),
+    ].join("");
+    expect(parseCodexHistory(text, "/synthetic/rollout-child.jsonl")).toEqual([]);
+  });
+
+  it("excludes the conservative string source=subagent form", () => {
+    const text = [
+      codexLine({
+        type: "session_meta",
+        payload: {
+          id: "synthetic-conservative-child",
+          source: "subagent",
+        },
+      }),
+      codexLine(codexMessage("user", [
+        { type: "input_text", text: "delegated prompt" },
+      ])),
+      codexLine(codexMessage("assistant", [
+        { type: "output_text", text: "delegated final" },
+      ], "final_answer")),
+    ].join("");
+    expect(parseCodexHistory(text, "/synthetic/rollout-string-child.jsonl")).toEqual([]);
+  });
+
+  it("keeps an ordinary source object that is not a child session", () => {
+    const text = [
+      codexLine({
+        type: "session_meta",
+        payload: {
+          id: "synthetic-ordinary-object",
+          thread_source: "user",
+          source: {
+            client: "vscode",
+            workspace: "/synthetic",
+          },
+        },
+      }),
+      codexLine(codexMessage("user", [
+        { type: "input_text", text: "ordinary prompt" },
+      ])),
+      codexLine(codexMessage("assistant", [
+        { type: "output_text", text: "ordinary final" },
+      ], "final_answer")),
+    ].join("");
+    expect(parseCodexHistory(text, "/synthetic/rollout-ordinary.jsonl")).toHaveLength(1);
+  });
+
   it("supports legacy event_msg without duplicating response_item messages", () => {
     const text = [
       codexLine({

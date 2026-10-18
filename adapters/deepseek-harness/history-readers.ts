@@ -58,6 +58,7 @@ export function parseCodexHistory(text: string, path: string): HistoryTurn[] {
   let sessionId = sessionIdFromCodexPath(path);
   let cwd: string | undefined;
   let pending: CodexTurnDraft | undefined;
+  let directHistory = true;
   const seenFinalIds = new Set<string>();
   const emitted = new Set<string>();
 
@@ -67,8 +68,11 @@ export function parseCodexHistory(text: string, path: string): HistoryTurn[] {
       const id = stringValue(payload, "id") ?? stringValue(payload, "session_id");
       if (id) sessionId = id;
       cwd = stringValue(payload, "cwd") ?? cwd;
+      directHistory = isDirectCodexSession(payload);
+      if (!directHistory) pending = undefined;
       return;
     }
+    if (!directHistory) return;
 
     if (record.type === "response_item") {
       const payload = asRecord(record.payload);
@@ -491,6 +495,26 @@ function isCompactionContinuation(value: string): boolean {
     || /^Another model has already been working on this task\b/i.test(value)
     || /^The conversation so far has been compacted\b/i.test(value)
     || /^Summary of the conversation so far\b/i.test(value);
+}
+
+function isDirectCodexSession(payload: JsonRecord | undefined): boolean {
+  if (!payload) return false;
+  const source = payload.source;
+  if (source === "subagent") return false;
+  if (typeof source === "string" && /^subagent$/i.test(source)) return false;
+
+  const threadSource = stringValue(payload, "thread_source");
+  if (threadSource === "subagent") return false;
+
+  const sourceRecord = asRecord(source);
+  if (sourceRecord) {
+    const subagent = asRecord(sourceRecord.subagent);
+    if (subagent) return false;
+    if (stringValue(sourceRecord, "kind") === "subagent") return false;
+  }
+
+  if (stringValue(payload, "parent_thread_id")) return false;
+  return true;
 }
 
 function extractWrappedHumanText(value: string): string | undefined {

@@ -304,7 +304,7 @@ export async function apply(
     });
     await history.load();
     settings.history = history;
-    core = federateMemoryCore(localCore, remote, () => history!.config.remote);
+    core = federateMemoryCore(localCore, remote, () => history!.config.remote, id => history!.sourceFor(id));
     const tokenPath = join(home.root, ".codex-mcp.json");
     let mcpToken: string;
     try {
@@ -324,7 +324,8 @@ export async function apply(
           llmFilterMalformedRetries: 0 }, { signal, foreground: true }),
         fetch: id => core!.getTrace(id),
       }),
-      peer: createMemoryPeerHandler({ core: localCore, config: () => history!.config.remote, profileId: config.profileId }),
+      peer: createMemoryPeerHandler({ core: localCore, config: () => history!.config.remote, profileId: config.profileId,
+        nodeId: process.platform === "win32" ? "local-dsh" : "nanopi" }),
     };
     if (typeof ctx.inject === "function") registerMemorySettingsHttp(ctx as unknown as SettingsConnectionContext, settings);
 
