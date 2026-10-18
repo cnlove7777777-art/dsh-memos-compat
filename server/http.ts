@@ -94,6 +94,15 @@ export async function startHttpServer(
       res.setHeader(k, v);
     }
     try {
+      const accessPath = (req.url || "/").split("?")[0];
+      if (deps.memoryAccess && accessPath === "/mcp") {
+        await deps.memoryAccess.mcp(req, res);
+        return;
+      }
+      if (deps.memoryAccess && ["/peer/health", "/peer/search", "/peer/detail"].includes(accessPath)) {
+        await deps.memoryAccess.peer(req, res);
+        return;
+      }
       await dispatch(req, res, routes, deps, runtimeOptions, log);
       trackSseResponse(req, res);
     } catch (err) {

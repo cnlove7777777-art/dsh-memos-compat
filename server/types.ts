@@ -77,6 +77,9 @@ export interface ServerHandle {
 }
 
 export interface ServerDeps {
+  /** Dedicated read-only, authenticated access mounted on the same listener. */
+  memoryAccess?: { mcp(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse): Promise<void>;
+    peer(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse): Promise<void> };
   /** Optional embedded DSH settings, shared with the native Settings section. */
   dshSettings?: import("../adapters/deepseek-harness/settings.js").MemorySettingsApi;
   /** The core that answers every API call. */

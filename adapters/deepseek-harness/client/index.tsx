@@ -44,6 +44,47 @@ interface EmbeddingTestResult {
   error?: string;
 }
 
+interface HistoryBackgroundModel {
+  provider: string;
+  model: string;
+}
+
+interface HistoryRemoteConfig {
+  enabled: boolean;
+  url: string;
+  tokenFile: string;
+  tunnelFile?: string;
+}
+
+interface HistoryConfig {
+  enabled: boolean;
+  codexRoot: string;
+  dshRoot: string;
+  recentDays: number;
+  backgroundModel?: HistoryBackgroundModel;
+  remote: HistoryRemoteConfig;
+}
+
+interface HistoryStatus {
+  running: boolean;
+  lastRunAt?: number;
+  imported: number;
+  skipped: number;
+  waitingForModel: boolean;
+  lastError?: string;
+}
+
+interface HistoryMcp {
+  url?: string;
+  enabled: boolean;
+}
+
+interface HistorySnapshot {
+  config: HistoryConfig;
+  status: HistoryStatus;
+  mcp: HistoryMcp;
+}
+
 interface JsonErrorEnvelope {
   error?: {
     message?: string;
@@ -52,6 +93,11 @@ interface JsonErrorEnvelope {
 
 interface TransportHooks {
   fetch?: typeof fetch;
+}
+
+interface HistoryApiFailure {
+  status?: number;
+  message: string;
 }
 
 interface SlotsContext {
@@ -65,6 +111,9 @@ const STYLE_ID = "@memtensor/memos-local-plugin/settings.css";
 const SETTINGS_PATH = "/api/memos/settings";
 const TEST_PATH = "/api/memos/test";
 const EMBEDDING_TEST_PATH = "/api/memos/embedding-test";
+const HISTORY_PATH = "/api/memos/history";
+const HISTORY_RUN_PATH = "/api/memos/history-run";
+const MEMORY_ROUTE_VALUE = "__memory_route__";
 
 const CSS = `
 .memos-settings-root {
@@ -219,6 +268,22 @@ const CSS = `
   font-size: 13px;
   cursor: pointer;
 }
+.memos-settings-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: .5px solid var(--dsw-alias-border-l4);
+  border-radius: var(--dsw-radius-md);
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-1);
+  font: inherit;
+  font-size: 13px;
+}
+.memos-settings-input::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+.memos-settings-input:focus-visible,
 .memos-settings-select:focus-visible,
 .memos-settings-button:focus-visible,
 .memos-settings-mode-card:focus-visible,
@@ -226,9 +291,52 @@ const CSS = `
   outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
   outline-offset: 2px;
 }
-.memos-settings-select:disabled {
+.memos-settings-select:disabled,
+.memos-settings-input:disabled {
   opacity: .55;
   cursor: default;
+}
+.memos-settings-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+.memos-settings-check-row input {
+  width: 16px;
+  height: 16px;
+  margin: 1px 0 0;
+  accent-color: var(--dsw-alias-state-business-primary);
+}
+.memos-settings-check-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.memos-settings-check-title {
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+}
+.memos-settings-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.memos-settings-readonly {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-module-platform);
+}
+.memos-settings-divider {
+  height: .5px;
+  background: var(--dsw-alias-border-l2);
 }
 .memos-settings-note {
   margin: 0;
@@ -339,7 +447,8 @@ const CSS = `
     flex-direction: column;
   }
   .memos-settings-mode-grid,
-  .memos-settings-embedding-grid {
+  .memos-settings-embedding-grid,
+  .memos-settings-field-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -410,7 +519,11 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
 
   const message = apiError(payload);
   if (!response.ok) {
-    throw new Error(message ?? `记忆插件接口请求失败（HTTP ${response.status}）。`);
+    const failure = new Error(
+      message ?? `记忆插件接口请求失败（HTTP ${response.status}）。`,
+    ) as Error & { status?: number };
+    failure.status = response.status;
+    throw failure;
   }
   if (message !== undefined) throw new Error(message);
   return payload as T;
@@ -441,6 +554,485 @@ function finitePositive(value: unknown): number | undefined {
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function historyFailureOf(cause: unknown): HistoryApiFailure {
+  const status = (cause as { status?: unknown } | null)?.status;
+  return {
+    status: typeof status === "number" ? status : undefined,
+    message: messageOf(cause),
+  };
+}
+
+function formatTimestamp(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return "尚未运行";
+  return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+
+function clampRecentDays(value: number): number {
+  return Math.min(30, Math.max(1, Math.round(value)));
+}
+
+function historyModelKey(model: HistoryBackgroundModel | undefined): string {
+  return model === undefined
+    ? MEMORY_ROUTE_VALUE
+    : modelKey(model.provider, model.model);
+}
+
+function parseHistoryModelKey(value: string): HistoryBackgroundModel | undefined {
+  if (value === MEMORY_ROUTE_VALUE) return undefined;
+  const separator = value.indexOf("\u0000");
+  if (separator <= 0) return undefined;
+  const provider = value.slice(0, separator);
+  const model = value.slice(separator + 1);
+  return provider && model ? { provider, model } : undefined;
+}
+
+function historyConfigDraft(snapshot: HistorySnapshot): HistoryConfig {
+  return {
+    enabled: snapshot.config.enabled,
+    codexRoot: snapshot.config.codexRoot,
+    dshRoot: snapshot.config.dshRoot,
+    recentDays: snapshot.config.recentDays,
+    ...(snapshot.config.backgroundModel === undefined
+      ? {}
+      : { backgroundModel: snapshot.config.backgroundModel }),
+    remote: { ...snapshot.config.remote },
+  };
+}
+
+function sameHistoryConfig(left: HistoryConfig, right: HistoryConfig): boolean {
+  return left.enabled === right.enabled
+    && left.codexRoot === right.codexRoot
+    && left.dshRoot === right.dshRoot
+    && left.recentDays === right.recentDays
+    && historyModelKey(left.backgroundModel) === historyModelKey(right.backgroundModel)
+    && left.remote.enabled === right.remote.enabled
+    && left.remote.url === right.remote.url
+    && left.remote.tokenFile === right.remote.tokenFile
+    && (left.remote.tunnelFile ?? "") === (right.remote.tunnelFile ?? "");
+}
+
+function historyModelGroups(models: ModelOption[]) {
+  const groups = new Map<string, { label: string; models: ModelOption[] }>();
+  for (const item of models) {
+    const group = groups.get(item.provider) ?? {
+      label: item.providerName?.trim() || item.provider,
+      models: [],
+    };
+    group.models.push(item);
+    groups.set(item.provider, group);
+  }
+  return [...groups.entries()]
+    .sort((a, b) => a[1].label.localeCompare(b[1].label))
+    .map(([provider, group]) => ({
+      provider,
+      label: group.label,
+      models: group.models.sort((a, b) =>
+        (a.modelName?.trim() || a.model).localeCompare(b.modelName?.trim() || b.model)
+      ),
+    }));
+}
+
+function historyField(
+  label: string,
+  value: string,
+  disabled: boolean,
+  onInput: (value: string) => void,
+  options: { type?: string; min?: number; max?: number; placeholder?: string } = {},
+) {
+  return (
+    <label className="memos-settings-field">
+      <span className="memos-settings-label">{label}</span>
+      <input
+        className="memos-settings-input"
+        type={options.type ?? "text"}
+        min={options.min}
+        max={options.max}
+        value={value}
+        disabled={disabled}
+        spellCheck={false}
+        placeholder={options.placeholder}
+        onInput={(event) => onInput(event.currentTarget.value)}
+      />
+    </label>
+  );
+}
+
+function historyCheckbox(
+  checked: boolean,
+  title: string,
+  description: string,
+  disabled: boolean,
+  onChange: (checked: boolean) => void,
+) {
+  return (
+    <label className="memos-settings-check-row">
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.currentTarget.checked)}
+      />
+      <span className="memos-settings-check-copy">
+        <span className="memos-settings-check-title">{title}</span>
+        <span className="memos-settings-muted">{description}</span>
+      </span>
+    </label>
+  );
+}
+
+function HistorySettingsCard({
+  snapshot,
+}: {
+  snapshot: SettingsSnapshot;
+}) {
+  const [history, setHistory] = useState<HistorySnapshot>();
+  const [draft, setDraft] = useState<HistoryConfig>();
+  const [capability, setCapability] = useState<"loading" | "ready" | "missing" | "error">("loading");
+  const [capabilityError, setCapabilityError] = useState("");
+  const [action, setAction] = useState<"" | "save" | "run" | "status">("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  const groupedModels = useMemo(
+    () => historyModelGroups(snapshot.models),
+    [snapshot.models],
+  );
+  const modelKeys = useMemo(
+    () => new Set(snapshot.models.map((item) => modelKey(item.provider, item.model))),
+    [snapshot.models],
+  );
+  const selectedModelKey = historyModelKey(draft?.backgroundModel);
+  const selectedModelAvailable = selectedModelKey === MEMORY_ROUTE_VALUE
+    || modelKeys.has(selectedModelKey);
+  const selectModelValue = draft?.backgroundModel === undefined
+    || selectedModelAvailable
+    ? selectedModelKey
+    : MEMORY_ROUTE_VALUE;
+  const savedModelKey = historyModelKey(history?.config.backgroundModel);
+  const savedModelAvailable = savedModelKey === MEMORY_ROUTE_VALUE
+    || modelKeys.has(savedModelKey);
+  const busy = action !== "";
+  const dirty = history !== undefined && draft !== undefined
+    && !sameHistoryConfig(draft, history.config);
+
+  const applyHistorySnapshot = (next: HistorySnapshot) => {
+    setHistory(next);
+    setDraft(historyConfigDraft(next));
+  };
+
+  const loadHistory = async () => {
+    setCapability("loading");
+    setCapabilityError("");
+    setError("");
+    try {
+      const next = await requestJson<HistorySnapshot>(HISTORY_PATH);
+      applyHistorySnapshot(next);
+      setCapability("ready");
+    } catch (cause) {
+      const failure = historyFailureOf(cause);
+      if (failure.status === 404) {
+        setCapability("missing");
+      } else {
+        setCapability("error");
+        setCapabilityError(failure.message);
+      }
+    }
+  };
+
+  useEffect(() => {
+    void loadHistory();
+  }, []);
+
+  const patchDraft = (patch: Partial<HistoryConfig>) => {
+    setDraft((previous) => previous === undefined
+      ? previous
+      : {
+          ...previous,
+          ...patch,
+          remote: patch.remote ?? previous.remote,
+        });
+    setMessage("");
+    setError("");
+  };
+
+  const patchRemote = (patch: Partial<HistoryRemoteConfig>) => {
+    setDraft((previous) => previous === undefined
+      ? previous
+      : {
+          ...previous,
+          remote: { ...previous.remote, ...patch },
+        });
+    setMessage("");
+    setError("");
+  };
+
+  const save = async () => {
+    if (draft === undefined || busy || !selectedModelAvailable) return;
+    setAction("save");
+    setMessage("");
+    setError("");
+    try {
+      const next = await requestJson<HistorySnapshot>(HISTORY_PATH, {
+        method: "PUT",
+        body: JSON.stringify(draft),
+      });
+      applyHistorySnapshot(next);
+      setCapability("ready");
+      setMessage("历史互通设置已保存。需要立即导入时请单独运行一次。");
+    } catch (cause) {
+      const failure = historyFailureOf(cause);
+      setError(`保存失败：${failure.message}`);
+      if (failure.status === 404) setCapability("missing");
+    } finally {
+      setAction("");
+    }
+  };
+
+  const run = async () => {
+    if (busy) return;
+    setAction("run");
+    setMessage("");
+    setError("");
+    try {
+      const next = await requestJson<HistorySnapshot>(HISTORY_RUN_PATH, {
+        method: "POST",
+      });
+      applyHistorySnapshot(next);
+      setCapability("ready");
+      setMessage("已提交历史整理任务。");
+    } catch (cause) {
+      const failure = historyFailureOf(cause);
+      setError(`运行失败：${failure.message}`);
+      if (failure.status === 404) setCapability("missing");
+    } finally {
+      setAction("");
+    }
+  };
+
+  const refreshStatus = async () => {
+    if (busy) return;
+    setAction("status");
+    setMessage("");
+    setError("");
+    try {
+      const next = await requestJson<HistorySnapshot>(HISTORY_PATH);
+      setHistory(next);
+      setDraft((previous) => previous === undefined
+        ? historyConfigDraft(next)
+        : dirty
+          ? previous
+          : historyConfigDraft(next));
+      setCapability("ready");
+      setMessage("运行状态已刷新。");
+    } catch (cause) {
+      const failure = historyFailureOf(cause);
+      setError(`刷新状态失败：${failure.message}`);
+      if (failure.status === 404) setCapability("missing");
+    } finally {
+      setAction("");
+    }
+  };
+
+  if (capability === "loading" && history === undefined) {
+    return (
+      <p className="memos-settings-muted">正在检查历史互通能力…</p>
+    );
+  }
+  if (capability === "missing") return null;
+  if (capability === "error") {
+    return (
+      <div className="memos-settings-card" role="alert">
+        <h3 className="memos-settings-card-title">无法读取历史互通设置</h3>
+        <p className="memos-settings-message" data-tone="error">{capabilityError}</p>
+      </div>
+    );
+  }
+  if (history === undefined || draft === undefined) return null;
+
+  const status = history.status;
+  return (
+    <div className="memos-settings-card">
+      <div className="memos-settings-card-head">
+        <div>
+          <h3 className="memos-settings-card-title">Codex 与 DSH 历史互通</h3>
+          <p className="memos-settings-muted">
+            只读取本地会话 JSONL，不执行其中的内容。最近窗口限制为 1–30 天。
+          </p>
+        </div>
+        <div className="memos-settings-chip-row">
+          <span className="memos-settings-chip" data-tone={draft.enabled ? "good" : "warn"}>
+            {draft.enabled ? "已启用" : "未启用"}
+          </span>
+          {status.running && <span className="memos-settings-chip" data-tone="good">运行中</span>}
+          {status.waitingForModel && <span className="memos-settings-chip" data-tone="warn">等待模型</span>}
+        </div>
+      </div>
+
+      {historyCheckbox(
+        draft.enabled,
+        "启用历史互通",
+        "启用只影响配置，不会自动导入；保存后仍需点击运行。",
+        busy,
+        (enabled) => patchDraft({ enabled }),
+      )}
+
+      <div className="memos-settings-field-grid">
+        {historyField(
+          "Codex 历史根目录",
+          draft.codexRoot,
+          busy,
+          (codexRoot) => patchDraft({ codexRoot }),
+          { placeholder: "例如 C:\\Users\\name\\.codex\\sessions" },
+        )}
+        {historyField(
+          "DSH 历史根目录",
+          draft.dshRoot,
+          busy,
+          (dshRoot) => patchDraft({ dshRoot }),
+          { placeholder: "例如 C:\\Users\\name\\.dsh\\sessions" },
+        )}
+        {historyField(
+          "最近天数",
+          String(draft.recentDays),
+          busy,
+          (recentDays) => patchDraft({
+            recentDays: clampRecentDays(Number(recentDays) || 1),
+          }),
+          { type: "number", min: 1, max: 30 },
+        )}
+        <label className="memos-settings-field">
+          <span className="memos-settings-label">后台整理模型</span>
+          <select
+            className="memos-settings-select"
+            value={selectModelValue}
+            disabled={busy}
+            onChange={(event) => patchDraft({
+              backgroundModel: parseHistoryModelKey(event.currentTarget.value),
+            })}
+          >
+            <option value={MEMORY_ROUTE_VALUE}>使用记忆固定模型（跟随模式下等待）</option>
+            {!selectedModelAvailable && (
+              <option value={selectedModelKey}>
+                当前已保存的模型不在本次目录中
+              </option>
+            )}
+            {groupedModels.map((group) => (
+              <optgroup key={group.provider} label={group.label}>
+                {group.models.map((item) => {
+                  const key = modelKey(item.provider, item.model);
+                  return (
+                    <option key={key} value={key}>
+                      {item.modelName?.trim() || item.model} · {item.model}
+                    </option>
+                  );
+                })}
+              </optgroup>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="memos-settings-divider" />
+
+      {historyCheckbox(
+        draft.remote.enabled,
+        "启用指定远端记忆库",
+        "只连接显式 URL；不扫描网络，不复制原始 Codex 会话。",
+        busy,
+        (enabled) => patchRemote({ enabled }),
+      )}
+
+      <div className="memos-settings-field-grid">
+        {historyField(
+          "远端 API 地址",
+          draft.remote.url,
+          busy,
+          (url) => patchRemote({ url }),
+          { type: "url", placeholder: "https://memory.example.com" },
+        )}
+        {historyField(
+          "Token 文件（JSON）",
+          draft.remote.tokenFile,
+          busy,
+          (tokenFile) => patchRemote({ tokenFile }),
+          { placeholder: "C:\\secrets\\memos-token.json" },
+        )}
+        {historyField(
+          "SSH 设置 JSON（可选）",
+          draft.remote.tunnelFile ?? "",
+          busy,
+          (tunnelFile) => patchRemote({ tunnelFile }),
+          { placeholder: "C:\\secrets\\ssh-settings.json" },
+        )}
+      </div>
+      <p className="memos-settings-note">
+        这里只填写已有 JSON 文件的路径，不显示或保存 token 内容；不会扫描目录。
+      </p>
+
+      <div className="memos-settings-readonly">
+        <span className="memos-settings-label">MCP 只读状态</span>
+        <span className="memos-settings-route">
+          {history.mcp.enabled ? "已启用" : "未启用"}
+          {history.mcp.url ? ` · ${history.mcp.url}` : " · 未提供地址"}
+        </span>
+        <span className="memos-settings-muted">MCP 状态为只读，不提供凭据输入或编辑。</span>
+      </div>
+
+      <div className="memos-settings-chip-row">
+        <span className="memos-settings-chip" data-tone={status.running ? "good" : "warn"}>
+          {status.running ? "正在运行" : "当前空闲"}
+        </span>
+        <span className="memos-settings-chip">已导入 {status.imported}</span>
+        <span className="memos-settings-chip">已跳过 {status.skipped}</span>
+        <span className="memos-settings-chip">上次运行 {formatTimestamp(status.lastRunAt)}</span>
+        {status.waitingForModel && (
+          <span className="memos-settings-chip" data-tone="warn">等待记忆模型</span>
+        )}
+      </div>
+      {status.lastError !== undefined && status.lastError !== "" && (
+        <p className="memos-settings-message" data-tone="warn">{status.lastError}</p>
+      )}
+
+      {error !== "" && (
+        <p className="memos-settings-message" data-tone="error" role="alert">{error}</p>
+      )}
+      {message !== "" && (
+        <p className="memos-settings-message" data-tone="success" role="status" aria-live="polite">
+          {message}
+        </p>
+      )}
+
+      <div className="memos-settings-actions">
+        <button
+          type="button"
+          className="memos-settings-button"
+          disabled={busy}
+          onClick={() => void refreshStatus()}
+        >
+          {action === "status" ? "刷新中…" : "刷新状态"}
+        </button>
+        <button
+          type="button"
+          className="memos-settings-button"
+          disabled={busy || history.config.enabled !== true || !savedModelAvailable}
+          onClick={() => void run()}
+        >
+          {action === "run" ? "运行中…" : "运行一次"}
+        </button>
+        <button
+          type="button"
+          className="memos-settings-button"
+          data-primary="true"
+          disabled={busy || !dirty || !selectedModelAvailable}
+          onClick={() => void save()}
+        >
+          {action === "save" ? "保存中…" : "保存"}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function SettingsView() {
@@ -904,6 +1496,8 @@ function SettingsView() {
               )}
             </div>
           </div>
+
+          <HistorySettingsCard snapshot={snapshot} />
         </>
       )}
     </section>

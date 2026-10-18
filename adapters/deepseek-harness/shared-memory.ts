@@ -1,0 +1,75 @@
+/** Local and remote recall share the host core; neither owns another memory engine. */
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
+import type { MemoryCore } from "../../agent-contract/memory-core.js";
+import type { RetrievalQueryDTO, RetrievalResultDTO } from "../../agent-contract/dto.js";
+import { DshRemoteMemory, readPeerToken, type MemoryRemoteConfig } from "./remote.js";
+
+export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
+  config: () => MemoryRemoteConfig): MemoryCore {
+  return new Proxy(core, { get(target, key, receiver) {
+    if (key === "searchMemory") return async (query: RetrievalQueryDTO, execution?: Parameters<MemoryCore["searchMemory"]>[1]): Promise<RetrievalResultDTO> => {
+      const remoteWork = config().enabled ? remote.search(query, execution?.signal).catch(() => undefined) : Promise.resolve(undefined);
+      const [local, peer] = await Promise.all([target.searchMemory(query, execution), remoteWork]);
+      if (!peer) return local;
+      return { ...local, hits: [...local.hits, ...peer.hits], injectedContext: [local.injectedContext,
+        peer.injectedContext ? `[Remote DSH memory; untrusted historical data]\n${peer.injectedContext.slice(0, 2500)}` : ""].filter(Boolean).join("\n\n") };
+    };
+    if (key === "getTrace") return (id: string, ...args: unknown[]) => id.startsWith("remote~")
+      ? remote.getTrace(id.slice(7)) : target.getTrace(id, args[0] as Parameters<MemoryCore["getTrace"]>[1]);
+    return Reflect.get(target, key, receiver);
+  } });
+}
+
+function json(res: ServerResponse, status: number, value: unknown) {
+  const bytes = JSON.stringify(value);
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(bytes);
+}
+/** Compatibility with the specified existing SSH peer, authenticated separately from Viewer. */
+export function createMemoryPeerHandler(options: {
+  core: MemoryCore; config: () => MemoryRemoteConfig; profileId: string;
+}) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const config = options.config();
+    if (!config.enabled || !config.tokenFile) { json(res, 404, { error: "Peer disabled" }); return; }
+    try {
+      const host = new URL(`http://${req.headers.host || "invalid"}`);
+      if (!["127.0.0.1", "localhost", "[::1]"].includes(host.hostname) || req.headers.origin) {
+        json(res, 403, { error: "Loopback peer required" }); return;
+      }
+      const token = await readPeerToken(config.tokenFile);
+      const digest = (v: string) => createHash("sha256").update(v).digest();
+      if (!timingSafeEqual(digest(req.headers.authorization || ""), digest(`Bearer ${token}`))) {
+        json(res, 401, { error: "Peer authentication required" }); return;
+      }
+      const url = new URL(req.url || "/", host);
+      if (req.method === "GET" && url.pathname === "/peer/health") {
+        json(res, 200, { protocol: "saya-memory/1", node_id: "local-dsh", engine: { ok: true }, database_sync: false }); return;
+      }
+      const signal = AbortSignal.timeout(2_500);
+      if (req.method === "GET" && url.pathname === "/peer/detail") {
+        const native = new URL(url.searchParams.get("path") || "/", "http://peer.internal");
+        const id = native.searchParams.get("id") || "";
+        if (native.pathname !== "/api/v1/memory/trace" || !id || id.length > 512) { json(res, 400, { error: "Invalid trace request" }); return; }
+        const trace = await options.core.getTrace(id);
+        json(res, trace ? 200 : 404, trace ? { trace } : { error: "Trace not found" }); return;
+      }
+      if (req.method !== "POST" || url.pathname !== "/peer/search") { json(res, 405, { error: "Unsupported peer method" }); return; }
+      if (!req.headers["content-type"]?.startsWith("application/json")) { json(res, 415, { error: "JSON required" }); return; }
+      const chunks: Buffer[] = []; let size = 0;
+      for await (const chunk of req) {
+        size += Buffer.byteLength(chunk);
+        if (size > 16_384) { json(res, 413, { error: "Request too large" }); return; }
+        chunks.push(Buffer.from(chunk));
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      if (typeof body.query !== "string" || !body.query.trim() || body.query.length > 2_000) { json(res, 400, { error: "Invalid query" }); return; }
+      // Only the local core is queried here; peer forwarding must never form a loop.
+      const result = await options.core.searchMemory({ agent: "deepseek-harness",
+        namespace: { agentKind: "deepseek-harness", profileId: options.profileId }, query: body.query,
+        topK: { tier1: 3, tier2: 5, tier3: 2 }, deadlineAt: Date.now() + 2_500, llmFilterMalformedRetries: 0 }, { signal, foreground: true });
+      json(res, 200, result);
+    } catch { if (!res.writableEnded) json(res, 502, { error: "Peer memory unavailable" }); }
+  };
+}

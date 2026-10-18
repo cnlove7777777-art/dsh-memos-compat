@@ -1,55 +1,48 @@
 # DSH memory plugin delivery boundaries
 
-## Phase 1: integrated memory settings
+## Integrated settings
 
-Implemented in `2.0.16-dsh.2`: one MemOS core inside DSH; native Settings entry;
-registered DSH model selection; immediate memory-specific routing; shared Viewer
-settings; active embedding probe. Installation uses the existing plugin manager.
-The package can be installed by URL/tarball while its market listing is pending.
-A listing submission and an accepted market listing are separate states.
+Implemented in `2.0.16-dsh.2`: one MemOS core inside DSH, native Settings entry,
+registered DSH model selection, immediate memory-specific routing, shared Viewer
+settings and active embedding probe. Package installation and market acceptance
+are separate states.
 
-The runtime starts and stops with its Cordis plugin. The existing loopback
-Viewer is an HTTP listener in that same process. No scheduled task, service,
-LAN scan or gateway discovery is needed for model selection.
+## Bounded local history and MCP
 
-## Phase 2: incremental Codex history worker (not implemented)
+Implemented in `2.0.16-dsh.3`: opt-in recent Codex JSONL and DSH V4/zstd readers,
+completed direct-human turns, model-refined summaries with source references,
+stable trace IDs, durable file signatures, bounded batches and embedding repair.
+The timer and cancellation belong to the Cordis plugin. Default window seven
+days; maximum thirty days. Background work needs an explicitly selected registered
+model or a fixed memory route. Follow without a route waits. Original history is
+read-only; no scheduled task, Python reader service or second memory core exists.
 
-Add an opt-in job queue owned by the same plugin lifecycle. Settings must show
-the selected history root, a recent time window, enabled state and last result.
-Do not import all history by default. Read local JSONL without executing any
-content. Store durable file/offset and content-digest cursors, debounce changes,
-use bounded idle batches and resume safely after DSH restarts. Separate raw
-observations from model-refined facts, with source references and deduplication.
-Use the fixed memory route for unattended refinement; follow mode must defer
-work when there is no owning conversation. Stop/cancel on plugin disposal.
-Do not claim extraction is enabled merely because Codex exposes an MCP client.
+The existing Viewer listener exposes bearer-authenticated, read-only `/mcp` for
+Codex. One-shot configuration preserves existing MCP servers. It advertises
+`memory_search` and `memory_get`; only trace detail is exposed. Dedicated
+MCP credentials grant no Viewer settings or import access. The Viewer retains
+its password/session gate. New Codex sessions or an MCP reconnect discover newly
+registered tools; registration is not itself proof of real conversation recall.
 
-## Phase 3: local and specified remote memory stores (not implemented)
+## Specified remote recall
 
-Keep the local database available offline. Configure one explicit remote API
-address and authenticated credential reference, with connection test and clear
-read/write controls. Query local/remote with independent timeouts and mark each
-result's source. Remote failures must not block local retrieval or chat startup.
-Remote writes need stable IDs, idempotency, a durable retry cursor and explicit
-conflict/deletion behavior. Never copy a live SQLite/WAL pair as a sync protocol.
-Do not scan the network or send raw Codex sessions to the server automatically.
+Implemented in `2.0.16-dsh.3`: one explicit authenticated peer, independently
+bounded local/remote queries, source labels, local-only peer dispatch to prevent
+forwarding loops, and read-only trace detail. Optional plugin-owned SSH transport
+reuses existing key/known-host configuration and stops on plugin disposal. This
+does not scan a LAN or select models by discovery. A DSH-only server does not
+need Codex or history extraction enabled to query the local peer.
 
-## Optional MCP access (not implemented)
+Remote writes, database synchronization, retrying write queues, deletion
+propagation and conflict resolution remain unimplemented. Neither a live SQLite
+copy nor automatic raw-session upload is used as a synchronization protocol.
 
-An MCP interface can expose search/record operations over the same runtime and
-database. Prefer a host-supported in-process transport where available; do not
-launch another daemon to duplicate the core. MCP registration alone neither
-extracts history nor synchronizes stores. Keep this access layer separate from
-the bounded maintenance queue.
+## Verification boundaries
 
-## Acceptance
-
-Phase 1: DSH's actual Settings navigation renders the entry, installed version
-matches the package, a saved fixed route is used by MemOS, follow routes remain
-isolated between conversations, a failed probe leaves the saved model intact,
-and the real local embedder returns a valid vector. Report isolated-runtime
-acceptance separately from the user's installed desktop acceptance.
-
-Later phases require crash/restart cursor recovery, offline local recall,
-bounded backlog handling, authenticated remote round trips, provenance and
-duplicate/conflict tests. They must not introduce an OS background task.
+Parser and transport fixtures cover malformed input, authentication, idempotency,
+limits, cancellation and offline behavior. Deployment acceptance must separately
+verify the installed version, visible Settings, real embedding, both local
+cross-application queries and both remote directions, with the original source
+session IDs and facts. Keep private transcripts, credentials and detailed live
+evidence outside the public repository. No extra data backup is created when
+the user has opted to retain their existing backup.

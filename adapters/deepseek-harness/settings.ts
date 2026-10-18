@@ -21,6 +21,7 @@ export interface DshModelRegistry extends DeepSeekHarnessLlmLike {
 }
 
 export interface MemorySettingsApi {
+  history?: import("./history.js").HistoryApi;
   snapshot(): Promise<unknown>;
   save(value: unknown): Promise<unknown>;
   test(value: unknown, signal?: AbortSignal): Promise<unknown>;
@@ -48,6 +49,7 @@ export function configureDshManagedModels(config: ResolvedConfig): ResolvedConfi
 }
 
 export class DshMemorySettings implements MemorySettingsApi {
+  history?: import("./history.js").HistoryApi;
   private selection: MemoryModelSelection = { mode: "follow" };
   private enabled: boolean;
   private writes: Promise<unknown> = Promise.resolve();
@@ -109,7 +111,7 @@ export class DshMemorySettings implements MemorySettingsApi {
       viewerUrl: this.options.viewerUrl?.() };
   }
 
-  private async validate(selection: MemoryModelSelection): Promise<void> {
+  async validate(selection: MemoryModelSelection): Promise<void> {
     if (selection.mode === "follow") return;
     const { models } = await this.models();
     if (!models.some(row => row.provider === selection.provider && row.model === selection.model)) {

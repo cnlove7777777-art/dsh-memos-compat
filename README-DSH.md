@@ -124,6 +124,54 @@ keyword-only, and `GET /api/v1/health` reports `embedder.available: false`.
 enabled state and execute its model and embedding tests. Core health reports
 client initialization; it does not prove a successful model request.
 
+## Shared history and Codex access (`2.0.16-dsh.3`)
+
+DSH Settings -> 记忆插件 now includes a separate history section. Opt in to local
+Codex and DSH session roots and a recent window (default seven days). The queue
+runs inside the plugin, at startup and once a minute, in bounded batches. It
+reads completed direct-human turns, excludes tools, injected instructions and
+delegated sessions, refines project facts using a registered DSH model, and
+repairs vectors through the existing local embedder. Stable source IDs and
+durable cursor receipts make retries and restarts idempotent. Source references
+remain attached to each imported memory. Original session files are not changed.
+
+Choose a background model explicitly, or use the memory selection's fixed
+model. Follow mode without an owning conversation waits; it does not reuse an
+arbitrary last model. A failed model call leaves the source pending. Current
+DSH conversation capture continues through the existing native lifecycle.
+
+The existing loopback Viewer listener also serves a read-only Streamable HTTP
+MCP endpoint at `/mcp`, protected by a dedicated random credential stored in
+`<memos-home>/.codex-mcp.json`. The Viewer's password gate remains in place.
+After DSH starts, connect Codex once:
+
+```sh
+node scripts/connect-codex.mjs <memos-home> <codex-home>
+```
+
+This adds the `dsh_memory` connection while preserving other Codex MCP servers.
+Reconnect MCP or start a new Codex session to discover `memory_search` and
+`memory_get`. DSH must be running for this connection to answer; it does not
+launch a second memory process. The credential is local setup data, never part
+of the package or repository. See [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+Optionally enable one explicit remote peer URL (HTTPS, or loopback through SSH)
+and select its existing JSON credential file. The supported peer protocol uses
+`/peer/search`, `/peer/detail` and `/peer/health`, not an arbitrary Viewer URL.
+Local and remote recall run independently within the DSH foreground deadline;
+remote failure leaves local recall available. Results identify the remote
+source. Peer access is read-only: raw Codex sessions and SQLite files are not
+copied, merged or uploaded. A server with DSH only needs remote recall enabled;
+leave its history roots empty and history maintenance disabled.
+
+An optional existing SSH settings file (`identity`, `known_hosts`,
+`last_address`, optional `username`) lets the plugin own the paired transport.
+It preserves host-key checking and never scans the network. The SSH child is
+only transport and stops with the plugin; no OS task or memory daemon is added.
+The paired NanoPi transport uses local forward 18794 -> server 18791 and reverse
+forward server 18793 -> this Viewer's port. Disable the old standalone connector
+before handing these ports to the plugin.
+
 ## Known limits
 
 - `iterate()` is materialized: `node:sqlite` exposes no streaming cursor in
@@ -132,9 +180,11 @@ client initialization; it does not prove a successful model request.
 - `unsafeMode()` is a no-op under `node:sqlite`, which does not enable
   `SQLITE_DBCONFIG_DEFENSIVE` — so `PRAGMA writable_schema` is already
   permitted and the migrations that need it still run.
-- Codex history ingestion, remote memory querying/maintenance and a local MCP
-  interface are **not implemented by this change**. See
-  [the phased plan](docs/DSH-MEMORY-PLAN.md).
+- Remote access currently provides federated read-only recall; bidirectional
+  database replication, remote writes and conflict/deletion merging are not
+  implemented. Source files exceeding the bounded reader limits need separate
+  handling; the worker never performs an unbounded whole-history import. See
+  [the delivery boundaries](docs/DSH-MEMORY-PLAN.md).
 
 ## Upstream
 

@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { api } from "../api/client";
 import { Icon } from "./Icon";
+import { DshHistorySettings } from "./DshHistorySettings";
 import {
   buildDshSavePayload,
   buildDshTestPayload,
@@ -528,6 +529,12 @@ export function DshMemorySettings({
               : `Embedding 测试失败：${embeddingError}`}
           </div>
         )}
+      </div>
+
+      <div
+        style="margin-top:var(--sp-5);padding-top:var(--sp-4);border-top:1px solid var(--border)"
+      >
+        <DshHistorySettings models={current.models} />
       </div>
     </section>
   );

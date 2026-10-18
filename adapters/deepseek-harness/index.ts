@@ -6,7 +6,8 @@ import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import Schema from "@deepseek-ai/schemastery";
-import { existsSync } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -41,6 +42,10 @@ import {
 import { registerDeepSeekHarnessTools } from "./tools.js";
 import { configureDshManagedModels, DshMemorySettings, type DshModelRegistry } from "./settings.js";
 import { registerMemorySettingsHttp, type SettingsConnectionContext } from "./settings-http.js";
+import { DshHistoryWorker } from "./history.js";
+import { DshRemoteMemory } from "./remote.js";
+import { createMemoryMcpHandler } from "./mcp.js";
+import { createMemoryPeerHandler, federateMemoryCore } from "./shared-memory.js";
 
 export const name = DEEPSEEK_HARNESS_PLUGIN;
 export const inject = ["systemPrompt", "tools", "llm"];
@@ -235,6 +240,8 @@ export async function apply(
   let viewer: ServerHandle | undefined;
   let viewerRetryController: AbortController | undefined;
   let viewerRetryTask: Promise<void> | undefined;
+  let history: DshHistoryWorker | undefined;
+  let remote: DshRemoteMemory | undefined;
   let disposing = false;
   const registrations: Array<() => void> = [];
   const unregisterAll = (): void => {
@@ -284,6 +291,41 @@ export async function apply(
       initLogging: false,
     });
     await core.init();
+    const localCore = core;
+    const backgroundBridge = createDeepSeekHarnessHostLlmBridge({ llm: ctx.llm, routes,
+      isEnabled: () => settings.isEnabled() });
+    remote = new DshRemoteMemory({ config: () => history!.config.remote, localPort: config.viewerPort });
+    history = new DshHistoryWorker({ home: home.root, profileId: config.profileId, core: localCore,
+      bridge: backgroundBridge, route: () => settings.route(),
+      withRoute: (route, operation) => routes.run(route, operation),
+      validateModel: selection => settings.validate(selection),
+      mcp: () => ({ enabled: !!viewer, url: viewer ? `${viewer.url}/mcp` : undefined }),
+      changed: async () => { await remote!.stop(); await remote!.start(); },
+    });
+    await history.load();
+    settings.history = history;
+    core = federateMemoryCore(localCore, remote, () => history!.config.remote);
+    const tokenPath = join(home.root, ".codex-mcp.json");
+    let mcpToken: string;
+    try {
+      const credential = JSON.parse(await fs.readFile(tokenPath, "utf8")) as { token?: unknown };
+      if (typeof credential.token !== "string" || credential.token.length < 32) throw new Error("Invalid MCP credential");
+      mcpToken = credential.token;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      mcpToken = randomBytes(32).toString("base64url");
+      await fs.writeFile(tokenPath, JSON.stringify({ token: mcpToken }) + "\n", { mode: 0o600, flag: "wx" });
+    }
+    const memoryAccess = {
+      mcp: createMemoryMcpHandler({ token: mcpToken,
+        search: (query, limit, signal) => core!.searchMemory({ agent: DEEPSEEK_HARNESS_AGENT,
+          namespace: { agentKind: DEEPSEEK_HARNESS_AGENT, profileId: config.profileId }, query,
+          topK: { tier1: 0, tier2: Math.min(limit, 10), tier3: 0 }, deadlineAt: Date.now() + 2_900,
+          llmFilterMalformedRetries: 0 }, { signal, foreground: true }),
+        fetch: id => core!.getTrace(id),
+      }),
+      peer: createMemoryPeerHandler({ core: localCore, config: () => history!.config.remote, profileId: config.profileId }),
+    };
     if (typeof ctx.inject === "function") registerMemorySettingsHttp(ctx as unknown as SettingsConnectionContext, settings);
 
     if (config.viewerEnabled) {
@@ -293,6 +335,7 @@ export async function apply(
           core: core!,
           home,
           dshSettings: settings,
+          memoryAccess,
           logTail: () => memoryBuffer().tail({ limit: 200 }),
         },
         {
@@ -379,6 +422,8 @@ export async function apply(
       }
     }
 
+    await remote.start();
+    history.start();
     const foregroundSearchTimeoutMs = deepSeekHarnessSearchTimeoutMs(
       config.recallTimeoutMs,
     );
@@ -459,6 +504,8 @@ export async function apply(
     disposing = true;
     unregisterAll();
     viewerRetryController?.abort();
+    await history?.stop();
+    await remote?.stop();
     if (viewerRetryTask) await viewerRetryTask;
     if (viewer) {
       try {
@@ -479,6 +526,8 @@ export async function apply(
     disposing = true;
     unregisterAll();
     viewerRetryController?.abort();
+    await history?.stop();
+    await remote?.stop();
     if (viewerRetryTask) await viewerRetryTask;
     if (viewer) {
       try {

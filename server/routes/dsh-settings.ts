@@ -8,7 +8,7 @@ export function registerDshSettingsRoutes(routes: Routes, deps: ServerDeps): voi
   const api = deps.dshSettings;
   for (const path of DSH_MEMORY_PATHS) {
     const viewerPath = path.replace("/api/memos/", "/api/v1/dsh/");
-    const methods = path.endsWith("/settings") ? ["GET", "PUT"] : ["POST"];
+    const methods = /\/(settings|history)$/.test(path) ? ["GET", "PUT"] : ["POST"];
     for (const method of methods) routes.set(`${method} ${viewerPath}`, async ctx => {
       const origin = ctx.req.headers.origin;
       const authority = ctx.req.headers.host;
