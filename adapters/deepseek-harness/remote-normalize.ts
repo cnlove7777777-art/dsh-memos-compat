@@ -84,15 +84,15 @@ export function normalizeTrace(value: unknown): TraceDTO | null {
   return value as unknown as TraceDTO;
 }
 
-export function deadlineFor(deadlineAt: number | undefined): number {
+export function deadlineFor(deadlineAt: number | undefined, maximumMs = MAX_SEARCH_TIMEOUT_MS): number {
   if (typeof deadlineAt !== "number" || !Number.isFinite(deadlineAt)) {
-    return MAX_SEARCH_TIMEOUT_MS;
+    return maximumMs;
   }
   const remaining = Math.floor(deadlineAt - Date.now());
   if (remaining <= 0) {
     throw new RemoteError("remote_timeout", "Remote memory deadline expired.");
   }
-  return Math.max(1, Math.min(MAX_SEARCH_TIMEOUT_MS, remaining));
+  return Math.max(1, Math.min(maximumMs, remaining));
 }
 
 function finiteNonNegative(value: unknown): number {

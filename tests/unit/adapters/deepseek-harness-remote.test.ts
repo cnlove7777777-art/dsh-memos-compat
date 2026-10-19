@@ -106,6 +106,24 @@ describe("peer protocol and credential boundaries", () => {
     const cancelled = new DshRemoteMemory({ localPort: 18801, config });
     await expect(cancelled.search(query, controller.signal)).rejects.toThrow();
   });
+  it("allows a slower WAN response while preserving an earlier caller deadline", async () => {
+    const { tokenFile } = await home();
+    const fetchMock = vi.fn(async (_url, init) => {
+      await new Promise<void>((resolve, reject) => {
+        const signal = init.signal as AbortSignal;
+        const abort = () => { clearTimeout(timer); reject(new Error("cancelled")); };
+        const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, 3100);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+      return signedResponse(init, result);
+    });
+    const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,
+      url: "https://example.test/desktop/api/memory-peer", tokenFile }), fetch: fetchMock as never });
+    expect((await client.search(query)).hits).toHaveLength(1);
+    await expect(client.search({ ...query, deadlineAt: Date.now() + 50 })).rejects.toThrow();
+  });
+
   it("rejects a response altered after the authenticated request", async () => {
     const { tokenFile } = await home();
     const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,

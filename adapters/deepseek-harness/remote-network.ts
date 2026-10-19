@@ -9,6 +9,7 @@ import { PeerRelay, type RelayCommand } from "./peer-relay.js";
 import { PEER_PROTOCOL, PEER_PORT, peerBaseUrl, peerUrl, signPeerRequest, handshakeProof, readPeerJson, validNodeId, isPrivateAddress } from "./peer-protocol.js";
 import { normalizeHit, normalizeTrace, normalizeLatency, deadlineFor, isJsonObject } from "./remote-normalize.js";
 import type { PeerSyncStore } from "./peer-sync.js";
+import { createPeerFetch, peerFetchFailure } from "./peer-fetch.js";
 
 export interface MemoryRemoteConfig {
   enabled: boolean; url: string; tokenFile: string;
@@ -68,9 +69,11 @@ export class DshRemoteMemory {
   private syncStatus: { lastRunAt?: number; lastError?: string } = {};
   private authRetryAfter = new Map<string, number>();
   private readonly fetchImpl: typeof fetch;
+  private readonly transport: ReturnType<typeof createPeerFetch>;
   private readonly reader: typeof readFile;
   constructor(private readonly options: DshRemoteMemoryOptions) {
-    this.fetchImpl = options.fetch ?? fetch; this.reader = options.readFile ?? readFile;
+    this.transport = createPeerFetch({ fetch: options.fetch });
+    this.fetchImpl = this.transport.fetch; this.reader = options.readFile ?? readFile;
   }
   async initialize(): Promise<void> { await this.load(); }
   setSync(store: PeerSyncStore | undefined): void { this.options.sync = store; }
@@ -140,6 +143,7 @@ export class DshRemoteMemory {
       await new Promise<void>(resolve => { listener.close(() => resolve()); listener.closeAllConnections(); });
     }
     await this.relayTask?.catch(() => undefined); await this.connectTask?.catch(() => undefined); await this.writes.catch(() => undefined);
+    await this.transport.close();
     this.route = undefined; this.status = { state: "disabled" };
   }
   async connect(force = true): Promise<RemoteStatus> {
@@ -159,7 +163,7 @@ export class DshRemoteMemory {
       if (!force && (this.authRetryAfter.get(candidate.url) ?? 0) > Date.now()) continue;
       try {
         const challenge = randomBytes(24).toString("hex"), key = await readPeerToken(config.tokenFile, this.reader);
-        const response = await this.requestAt(candidate.url, "/peer/handshake", { challenge, nodeId: this.nodeId(), profile_id: this.options.profileId || "default" }, undefined, 3000);
+        const response = await this.requestAt(candidate.url, "/peer/handshake", { challenge, nodeId: this.nodeId(), profile_id: this.options.profileId || "default" }, undefined, candidate.kind === "wan" ? 8000 : 3000);
         if (!isJsonObject(response) || response.protocol !== PEER_PROTOCOL || !validNodeId(response.node_id) ||
           typeof response.proof !== "string" || !/^[a-f0-9]{64}$/.test(response.proof) ||
           !timingSafeEqual(Buffer.from(response.proof, "hex"), Buffer.from(handshakeProof(key, challenge, response.node_id), "hex"))) throw new Error("Peer handshake failed");
@@ -189,7 +193,7 @@ export class DshRemoteMemory {
   async search(query: RetrievalQueryDTO, signal?: AbortSignal): Promise<RetrievalResultDTO> {
     if (!this.options.config().enabled) throw new Error("Remote memory is disabled");
     try {
-      const raw = await this.call("search", { query: query.query, topK: query.topK }, signal, deadlineFor(query.deadlineAt));
+      const raw = await this.call("search", { query: query.query, topK: query.topK }, signal, deadlineFor(query.deadlineAt, this.hasWanRoute() ? 8000 : 2800));
       if (!isJsonObject(raw) || !Array.isArray(raw.hits)) throw new Error("Invalid peer search result");
       return { query, hits: raw.hits.slice(0, 50).map(normalizeHit), injectedContext: typeof raw.injectedContext === "string" ? raw.injectedContext : "",
         tierLatencyMs: normalizeLatency(raw.tierLatencyMs) };
@@ -211,13 +215,14 @@ export class DshRemoteMemory {
   async getTrace(id: string, signal?: AbortSignal, _namespace?: RuntimeNamespace): Promise<TraceDTO | null> {
     if (!this.options.config().enabled) throw new Error("Remote memory is disabled");
     if (id.startsWith("replica~")) return this.options.sync?.getTrace(id) ?? null;
-    try { const raw = await this.call("detail", { id }, signal, 2800); return normalizeTrace(isJsonObject(raw) && "trace" in raw ? raw.trace : raw); }
+    try { const raw = await this.call("detail", { id }, signal, this.hasWanRoute() ? 8000 : 2800); return normalizeTrace(isJsonObject(raw) && "trace" in raw ? raw.trace : raw); }
     catch (error) {
       if (signal?.aborted) throw error;
       const trace = this.options.config().syncEnabled ? await this.options.sync?.getTrace(id, this.expectedNodeId()) : undefined;
       if (trace) return trace; throw error;
     }
   }
+  private hasWanRoute(): boolean { return this.route?.kind === "wan" || this.options.config().url.startsWith("https:"); }
   private async call(kind: "search" | "detail", value: Record<string, unknown>, signal?: AbortSignal, timeout = 2800): Promise<unknown> {
     const end = Date.now() + timeout, configured = this.options.config().url;
     const routes = [...(this.route ? [this.route.url] : []), ...(configured && configured !== this.route?.url ? [configured] : [])];
@@ -313,7 +318,7 @@ export class DshRemoteMemory {
     const signals = [AbortSignal.timeout(timeout), ...(signal ? [signal] : []), ...(this.controller ? [this.controller.signal] : [])];
     let response: Response;
     try { response = await this.fetchImpl(target, { method, headers, ...(body ? { body } : {}), signal: AbortSignal.any(signals), redirect: "error" }); }
-    catch { throw new Error("Remote peer unavailable or timed out"); }
+    catch (error) { throw new Error(peerFetchFailure(error)); }
     if (!response.ok) { await response.body?.cancel();
       if (response.status === 401 || response.status === 403) throw new PeerAuthError("Remote session or pairing key rejected");
       throw new Error("Remote request failed"); }

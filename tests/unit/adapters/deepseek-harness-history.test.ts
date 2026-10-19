@@ -137,12 +137,13 @@ function stats(ready = 1) {
 function bridgeFake(options: {
   reject?: Error;
   onComplete?: () => Promise<void>;
+  text?: string;
 } = {}) {
   const complete = vi.fn(async () => {
     if (options.onComplete) await options.onComplete();
     if (options.reject) throw options.reject;
     return {
-      text: "{\"summary\":\"synthetic refined memory\"}",
+      text: options.text ?? "{\"summary\":\"synthetic refined memory\"}",
       model: "synthetic",
       durationMs: 1,
     };
@@ -436,6 +437,44 @@ describe("DshHistoryWorker synthetic lifecycle", () => {
     await run.worker.waitForIdle();
     expect(run.bridge.complete).toHaveBeenCalledOnce();
     expect(run.core.importBundle).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'Here is the summary:\n```json\n{"summary":"synthetic refined memory"}\n```',
+    '<think>synthetic reasoning with {"summary":"wrong"}</think>\n{"summary":"synthetic refined memory"}',
+    '{"summary":"synthetic refined memory",}',
+  ])("accepts a formatted model summary without storing its wrapper", async (text) => {
+    const home = await tempHome();
+    const cfg = config(home);
+    await historyFile(cfg.codexRoot, "rollout-format.jsonl");
+    const run = await worker({ home, ...cfg, turns: [turn(1)], bridge: bridgeFake({ text }) });
+    await run.start(); await run.worker.waitForIdle();
+    expect(run.core.importBundle).toHaveBeenCalledOnce();
+    expect(run.core.importBundle.mock.calls[0]![0].traces![0]).toMatchObject({ summary: "synthetic refined memory" });
+    expect((await run.worker.snapshot()).status.lastError).toBeUndefined();
+  });
+
+  it("isolates an invalid summary, persists its retry and continues with other turns", async () => {
+    const home = await tempHome();
+    const cfg = config(home);
+    const file = await historyFile(cfg.codexRoot, "rollout-format-retry.jsonl");
+    const bridge = bridgeFake();
+    bridge.complete.mockResolvedValueOnce({ text: 'null', model: 'synthetic', durationMs: 1 });
+    const first = await worker({ home, ...cfg, turns: [turn(1), turn(2)], bridge });
+    await first.start(); await first.worker.waitForIdle();
+    expect(first.core.importBundle).toHaveBeenCalledOnce();
+    expect((await first.worker.snapshot()).status).toMatchObject({ skippedSummaries: 1, imported: 1 });
+    expect((await first.worker.snapshot()).status.lastError).toBeUndefined();
+    expect(JSON.parse(await readFile(join(home, 'dsh-history-cursors.json'), 'utf8')).files[file]).toBeUndefined();
+    const resumed = await worker({ home, ...cfg, turns: [turn(1), turn(2)], core: first.core });
+    await resumed.resume(); await resumed.worker.waitForIdle();
+    expect(resumed.bridge.complete).not.toHaveBeenCalled();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 300_001);
+    try {
+      await resumed.worker.run(); await resumed.worker.waitForIdle();
+      expect(resumed.bridge.complete).toHaveBeenCalledOnce();
+      expect((await resumed.worker.snapshot()).status.skippedSummaries).toBe(0);
+    } finally { clock.mockRestore(); }
   });
 
   it("does not checkpoint after a model failure and retries the turn", async () => {

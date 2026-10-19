@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import type { MemoryCore } from "../../agent-contract/memory-core.js";
 import type { HostLlmBridge } from "../../core/llm/host-bridge.js";
+import { parseLlmJson } from "../../core/llm/json-mode.js";
 import { MemosError } from "../../agent-contract/errors.js";
 import { HistoryInputLimitError, readHistoryFile, type HistoryTurn } from "./history-readers.js";
 import type { DeepSeekHarnessLlmRoute } from "./host-llm.js";
@@ -28,6 +29,7 @@ interface HistoryStatus {
   running: boolean; imported: number; skipped: number; waitingForModel: boolean;
   lastRunAt?: number; lastError?: string; lastErrorCode?: string;
   skippedFiles?: number; lastWarning?: string;
+  skippedSummaries?: number;
 }
 export interface HistoryApi {
   snapshot(): Promise<unknown>;
@@ -112,6 +114,7 @@ export class DshHistoryWorker implements HistoryApi {
   private writes: Promise<unknown> = Promise.resolve();
   private priorityPaths?: Set<string>;
   private sources: Record<string, { source: string; sessionId: string; ref: string; ts: number; model?: string }> = {};
+  private summaryRetries: Record<string, { retryAfter: number; ts: number }> = {};
   constructor(private readonly options: {
     home: string; profileId: string; core: MemoryCore; bridge: HostLlmBridge;
     route: () => DeepSeekHarnessLlmRoute | undefined;
@@ -150,6 +153,10 @@ export class DshHistoryWorker implements HistoryApi {
       const saved = JSON.parse(await fs.readFile(join(this.options.home, "dsh-history-sources.json"), "utf8"));
       if (saved.version === 1 && saved.sources && typeof saved.sources === "object") this.sources = saved.sources;
     } catch { /* Source receipts can be recovered by rereading original histories. */ }
+    try {
+      const saved = JSON.parse(await fs.readFile(join(this.options.home, "dsh-history-retries.json"), "utf8"));
+      if (saved.version === 1 && saved.turns && typeof saved.turns === "object") this.summaryRetries = saved.turns;
+    } catch { /* A missing retry receipt only causes an earlier bounded retry. */ }
     try {
       const saved = JSON.parse(await fs.readFile(join(this.options.home, "dsh-history-priority.json"), "utf8"));
       if (Array.isArray(saved.sourceFiles) && saved.sourceFiles.length <= 4 && saved.sourceFiles.every((p: unknown) => typeof p === "string")) {
@@ -259,6 +266,7 @@ export class DshHistoryWorker implements HistoryApi {
     this.status.waitingForModel = !route;
     if (!route) return;
     const cutoff = Date.now() - config.recentDays * 86_400_000;
+    for (const [id, retry] of Object.entries(this.summaryRetries)) if (retry.ts < cutoff) delete this.summaryRetries[id];
     // Explicit validation runs may prioritize existing files, never escape the configured roots/window.
     const files = (await discoverHistoryFiles(config, cutoff)).filter(file => !priority || priority.has(file.path));
     const updateWarnings = () => {
@@ -268,7 +276,11 @@ export class DshHistoryWorker implements HistoryApi {
       });
       const large = skipped.filter(file => this.cursors[file.path].skippedReason === "too-large").length;
       this.status.skippedFiles = skipped.length;
-      this.status.lastWarning = skipped.length ? `已跳过 ${skipped.length} 个暂时无法读取的历史文件（${large} 个超过大小上限），其余文件继续整理。` : undefined;
+      this.status.skippedSummaries = Object.keys(this.summaryRetries).length;
+      this.status.lastWarning = [
+        ...(skipped.length ? [`已跳过 ${skipped.length} 个暂时无法读取的历史文件（${large} 个超过大小上限），其余文件继续整理。`] : []),
+        ...(this.status.skippedSummaries ? [`${this.status.skippedSummaries} 条摘要格式无效，已暂缓五分钟后重试，其他记录继续整理。`] : []),
+      ].join(" ") || undefined;
     };
     updateWarnings();
     files.sort((a, b) => (this.cursors[a.path]?.checkedAt || 0) - (this.cursors[b.path]?.checkedAt || 0) || b.mtime - a.mtime);
@@ -313,6 +325,7 @@ export class DshHistoryWorker implements HistoryApi {
         }
         this.phase = "import";
         if (await this.options.core.getTrace(id)) { this.status.skipped++; continue; }
+        if ((this.summaryRetries[id]?.retryAfter ?? 0) > Date.now()) { complete = false; continue; }
         if (budget <= 0 || fileBudget <= 0) { complete = false; break; }
         budget--;
         fileBudget--;
@@ -325,17 +338,33 @@ export class DshHistoryWorker implements HistoryApi {
           maxTokens: 1600, timeoutMs: 40_000, temperature: 0, signal,
         }));
         this.phase = "parse";
-        const text = result.text.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
-        const parsed = JSON.parse(text) as { summary?: unknown };
-        if (typeof parsed.summary !== "string" || !parsed.summary.trim() || parsed.summary.length > 4_000) {
-          throw new Error("Invalid refined memory");
+        let summary: string;
+        try {
+          const text = result.text.replace(/^\s*<think\b[^>]*>[\s\S]*?<\/think>/i, "").trim();
+          const parsed = parseLlmJson<{ summary?: unknown } | null>(text, { op: "dsh-history" });
+          if (!parsed || typeof parsed.summary !== "string" || !parsed.summary.trim() || parsed.summary.length > 4_000) throw new Error("Invalid refined memory");
+          summary = parsed.summary.trim();
+        } catch {
+          signal.throwIfAborted();
+          this.summaryRetries[id] = { retryAfter: Date.now() + 300_000, ts: turn.ts };
+          complete = false;
+          this.phase = "checkpoint";
+          await atomicHistoryJson(join(this.options.home, "dsh-history-retries.json"), { version: 1, turns: this.summaryRetries });
+          updateWarnings();
+          continue;
+        }
+        if (this.summaryRetries[id]) {
+          delete this.summaryRetries[id];
+          this.phase = "checkpoint";
+          await atomicHistoryJson(join(this.options.home, "dsh-history-retries.json"), { version: 1, turns: this.summaryRetries });
+          updateWarnings();
         }
         signal.throwIfAborted();
         this.phase = "import";
         const imported = await this.options.core.importBundle({ version: 1, traces: [{
           id, sessionId: `history:${turn.source}:${turn.sessionId}`, episodeId: `ep_${id}`,
           ownerAgentKind: "deepseek-harness", ownerProfileId: this.options.profileId,
-          ts: turn.ts, turnId: turn.ts, userText, agentText, summary: redactHistoryText(parsed.summary),
+          ts: turn.ts, turnId: turn.ts, userText, agentText, summary: redactHistoryText(summary),
           tags: ["lightweight_memory", "history_backfill", `source:${turn.source}`, `source_session:${turn.sessionId}`,
             `source_ref:${turn.sourceRef}`, `refined_by:${route.provider}/${route.model}`],
           toolCalls: [], value: 0, alpha: 0, priority: 0.5,

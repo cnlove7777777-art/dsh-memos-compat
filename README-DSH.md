@@ -56,7 +56,7 @@ and install its tarball. The GitHub default branch may contain an older version:
 
 ```sh
 npm pack
-dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.7.tgz
+dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.8.tgz
 ```
 
 DSH's plugin manager owns dependency installation and bundle registration.
@@ -176,7 +176,7 @@ market-owned pairing key into plugin-owned credentials. The v6 runtime discards
 SSH tunnel settings. Verify the migrated credentials and a real peer connection
 before removing an older standalone connector.
 
-## History recovery (`2.0.16-dsh.7`)
+## History recovery (`2.0.16-dsh.8`)
 
 A history file that exceeds the bounded reader limits no longer stops the
 queue. The worker records the skipped file's size and modification time,
@@ -187,6 +187,11 @@ Model, summary-format, import and embedding failures now have separate safe
 status messages. The original history and existing memories are preserved.
 Control-only Codex notifications are excluded even when followed by an assistant
 answer. Peer requests identify themselves as `MemOS-DSH/2` for machine gateways.
+Formatted JSON summaries use the shared bounded parser. An invalid summary is
+deferred for five minutes while other turns continue; retry receipts survive a
+restart. Public HTTPS peers respect existing proxy and NO_PROXY settings through
+a per-client dispatcher, while LAN peers connect directly. WAN calls allow up to
+eight seconds, still respecting an earlier caller deadline or cancellation.
 
 ## Known limits
 
@@ -210,3 +215,4 @@ answer. Peer requests identify themselves as `MemOS-DSH/2` for machine gateways.
   attribution and the license files shipped in this repository.
 
 The upstream README is preserved verbatim as [`README.upstream.md`](./README.upstream.md).
+
