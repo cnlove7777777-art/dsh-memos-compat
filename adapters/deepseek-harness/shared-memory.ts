@@ -4,6 +4,8 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { MemoryCore } from "../../agent-contract/memory-core.js";
 import type { RetrievalQueryDTO, RetrievalResultDTO } from "../../agent-contract/dto.js";
 import { DshRemoteMemory, readPeerToken, type MemoryRemoteConfig } from "./remote.js";
+import { PEER_PROTOCOL, PEER_PORT, MAX_PEER_BYTES, PeerReplayGuard, isPrivateAddress, handshakeProof } from "./peer-protocol.js";
+import type { PeerSyncStore } from "./peer-sync.js";
 
 export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
   config: () => MemoryRemoteConfig, sourceFor?: (id: string) => unknown): MemoryCore {
@@ -32,6 +34,7 @@ export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
     };
     if (key === "getTrace") return async (id: string, ...args: unknown[]) => {
       if (id.startsWith("remote~")) return remote.getTrace(id.slice(7));
+      if (id.startsWith("replica~")) return remote.getTrace(id);
       const trace = await target.getTrace(id, args[0] as Parameters<MemoryCore["getTrace"]>[1]);
       const source = sourceFor?.(id);
       return trace && source ? { ...trace, source } : trace;
@@ -45,50 +48,93 @@ function json(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(bytes);
 }
-/** Compatibility with the specified existing SSH peer, authenticated separately from Viewer. */
+/** Only this authenticated API is exposed on the LAN; Viewer and MCP stay local. */
 export function createMemoryPeerHandler(options: {
   core: MemoryCore; config: () => MemoryRemoteConfig; profileId: string; nodeId?: string;
+  remote?: DshRemoteMemory; sync?: () => PeerSyncStore | undefined;
 }) {
+  const replay = new PeerReplayGuard();
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const config = options.config();
     if (!config.enabled || !config.tokenFile) { json(res, 404, { error: "Peer disabled" }); return; }
     try {
-      const host = new URL(`http://${req.headers.host || "invalid"}`);
-      if (!["127.0.0.1", "localhost", "[::1]"].includes(host.hostname) || req.headers.origin) {
-        json(res, 403, { error: "Loopback peer required" }); return;
+      const address = req.socket.remoteAddress || "";
+      if (!isPrivateAddress(address) || req.headers.origin) {
+        json(res, 403, { error: "Private peer connection required" }); return;
       }
-      const token = await readPeerToken(config.tokenFile);
-      const digest = (v: string) => createHash("sha256").update(v).digest();
-      if (!timingSafeEqual(digest(req.headers.authorization || ""), digest(`Bearer ${token}`))) {
-        json(res, 401, { error: "Peer authentication required" }); return;
+      const url = new URL(req.url || "/", "http://peer.internal");
+      const supported = ["/peer/health", "/peer/handshake", "/peer/search", "/peer/detail",
+        "/peer/relay/poll", "/peer/relay/results", "/peer/sync/pull", "/peer/sync/push"];
+      if (!supported.includes(url.pathname)) { json(res, 404, { error: "Unknown peer route" }); return; }
+      if (!(req.method === "POST" || req.method === "GET" && ["/peer/health", "/peer/detail"].includes(url.pathname))) {
+        json(res, 405, { error: "Unsupported peer method" }); return;
       }
-      const url = new URL(req.url || "/", host);
-      if (req.method === "GET" && url.pathname === "/peer/health") {
-        json(res, 200, { protocol: "saya-memory/1", node_id: options.nodeId || "local-dsh", engine: { ok: true }, database_sync: false }); return;
+      if (!req.headers["x-memory-signature"] && !req.headers.authorization) { json(res, 401, { error: "Peer authentication required" }); return; }
+      if (req.method === "POST" && !req.headers["content-type"]?.startsWith("application/json")) {
+        json(res, 415, { error: "JSON required" }); return;
       }
-      const signal = AbortSignal.timeout(2_500);
-      if (req.method === "GET" && url.pathname === "/peer/detail") {
-        const native = new URL(url.searchParams.get("path") || "/", "http://peer.internal");
-        const id = native.searchParams.get("id") || "";
-        if (native.pathname !== "/api/v1/memory/trace" || !id || id.length > 512) { json(res, 400, { error: "Invalid trace request" }); return; }
-        const trace = await options.core.getTrace(id);
-        json(res, trace ? 200 : 404, trace ? { trace } : { error: "Trace not found" }); return;
-      }
-      if (req.method !== "POST" || url.pathname !== "/peer/search") { json(res, 405, { error: "Unsupported peer method" }); return; }
-      if (!req.headers["content-type"]?.startsWith("application/json")) { json(res, 415, { error: "JSON required" }); return; }
       const chunks: Buffer[] = []; let size = 0;
       for await (const chunk of req) {
         size += Buffer.byteLength(chunk);
-        if (size > 16_384) { json(res, 413, { error: "Request too large" }); return; }
+        if (size > MAX_PEER_BYTES) { json(res, 413, { error: "Request too large" }); return; }
         chunks.push(Buffer.from(chunk));
       }
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      const text = Buffer.concat(chunks).toString("utf8");
+      const token = await readPeerToken(config.tokenFile);
+      const digest = (v: string) => createHash("sha256").update(v).digest();
+      const signedNode = replay.verify(token, req.method!, url.pathname + url.search, text, req.headers,
+        options.remote?.expectedNodeId() || config.expectedNodeId);
+      // Legacy loopback read clients can finish their upgrade, but cannot pair,
+      // relay or synchronize with a bearer alone.
+      const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address);
+      const legacyRead = loopback && !req.headers["x-memory-signature"] &&
+        ["/peer/health", "/peer/search", "/peer/detail"].includes(url.pathname) &&
+        timingSafeEqual(digest(req.headers.authorization || ""), digest(`Bearer ${token}`));
+      if (!signedNode && !legacyRead) {
+        json(res, 401, { error: "Peer authentication required" }); return;
+      }
+      const body = text ? JSON.parse(text) as Record<string, unknown> : {};
+      const nodeId = options.remote?.nodeId() || options.nodeId || "local-dsh";
+      if (req.method === "GET" && url.pathname === "/peer/health") {
+        json(res, 200, { protocol: PEER_PROTOCOL, node_id: nodeId, engine: { ok: true }, database_sync: !!config.syncEnabled }); return;
+      }
+      if (url.pathname === "/peer/handshake") {
+        if (!signedNode || body.nodeId !== signedNode || typeof body.challenge !== "string" || !/^[a-f0-9]{48}$/.test(body.challenge)) {
+          json(res, 400, { error: "Invalid handshake" }); return;
+        }
+        await options.remote?.acceptPeer(signedNode);
+        json(res, 200, { protocol: PEER_PROTOCOL, node_id: nodeId, peer_port: config.peerPort ?? PEER_PORT,
+          proof: handshakeProof(token, body.challenge, nodeId), database_sync: !!config.syncEnabled,
+          capabilities: ["search", "detail", "relay", ...(config.syncEnabled ? ["sync"] : [])] }); return;
+      }
+      if (url.pathname.startsWith("/peer/relay/") || url.pathname.startsWith("/peer/sync/")) {
+        if (!signedNode || !options.remote) { json(res, 403, { error: "Signed pairing required" }); return; }
+        await options.remote.acceptPeer(signedNode);
+        if (url.pathname === "/peer/relay/poll") { json(res, 200, { commands: await options.remote.relay.poll(signedNode) }); return; }
+        if (url.pathname === "/peer/relay/results") { options.remote.relay.results(signedNode, body.results); json(res, 200, { ok: true }); return; }
+        const store = options.sync?.();
+        if (!config.syncEnabled || !store) { json(res, 403, { error: "Synchronization disabled" }); return; }
+        if (url.pathname === "/peer/sync/pull") {
+          json(res, 200, await store.exportPage({ cursor: typeof body.cursor === "string" ? body.cursor : undefined,
+            limit: typeof body.limit === "number" ? Math.min(50, Math.max(1, body.limit)) : 20 })); return;
+        }
+        await store.importPage(body as unknown as Parameters<PeerSyncStore["importPage"]>[0], signedNode);
+        json(res, 200, { ok: true }); return;
+      }
+      const signal = AbortSignal.timeout(2_500);
+      if (url.pathname === "/peer/detail") {
+        const native = new URL(url.searchParams.get("path") || "/", "http://peer.internal");
+        const id = req.method === "POST" ? body.id : native.pathname === "/api/v1/memory/trace" ? native.searchParams.get("id") : "";
+        if (typeof id !== "string" || !id || id.length > 512 || /^(remote|replica)~/.test(id)) { json(res, 400, { error: "Invalid trace request" }); return; }
+        const trace = await options.core.getTrace(id);
+        json(res, trace ? 200 : 404, trace ? { trace } : { error: "Trace not found" }); return;
+      }
       if (typeof body.query !== "string" || !body.query.trim() || body.query.length > 2_000) { json(res, 400, { error: "Invalid query" }); return; }
       // Only the local core is queried here; peer forwarding must never form a loop.
       const result = await options.core.searchMemory({ agent: "deepseek-harness",
         namespace: { agentKind: "deepseek-harness", profileId: options.profileId }, query: body.query,
         topK: { tier1: 3, tier2: 5, tier3: 2 }, deadlineAt: Date.now() + 2_500, llmFilterMalformedRetries: 0 }, { signal, foreground: true });
       json(res, 200, result);
-    } catch { if (!res.writableEnded) json(res, 502, { error: "Peer memory unavailable" }); }
+    } catch (error) { if (!res.writableEnded) json(res, error instanceof SyntaxError ? 400 : 502, { error: "Peer memory unavailable" }); }
   };
 }

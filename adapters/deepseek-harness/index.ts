@@ -46,6 +46,7 @@ import { DshHistoryWorker } from "./history.js";
 import { DshRemoteMemory } from "./remote.js";
 import { createMemoryMcpHandler } from "./mcp.js";
 import { createMemoryPeerHandler, federateMemoryCore } from "./shared-memory.js";
+import { PeerSyncStore } from "./peer-sync.js";
 
 export const name = DEEPSEEK_HARNESS_PLUGIN;
 export const inject = ["systemPrompt", "tools", "llm"];
@@ -242,6 +243,7 @@ export async function apply(
   let viewerRetryTask: Promise<void> | undefined;
   let history: DshHistoryWorker | undefined;
   let remote: DshRemoteMemory | undefined;
+  let syncStore: PeerSyncStore | undefined;
   let disposing = false;
   const registrations: Array<() => void> = [];
   const unregisterAll = (): void => {
@@ -294,15 +296,31 @@ export async function apply(
     const localCore = core;
     const backgroundBridge = createDeepSeekHarnessHostLlmBridge({ llm: ctx.llm, routes,
       isEnabled: () => settings.isEnabled() });
-    remote = new DshRemoteMemory({ config: () => history!.config.remote, localPort: config.viewerPort });
+    const localSearch = (query: string, signal?: AbortSignal) => localCore.searchMemory({ agent: DEEPSEEK_HARNESS_AGENT,
+      namespace: { agentKind: DEEPSEEK_HARNESS_AGENT, profileId: config.profileId }, query,
+      topK: { tier1: 3, tier2: 5, tier3: 2 }, deadlineAt: Date.now() + 2_500, llmFilterMalformedRetries: 0 },
+      { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_500)]) : AbortSignal.timeout(2_500), foreground: true });
+    remote = new DshRemoteMemory({ config: () => history!.config.remote, localPort: config.viewerPort, home: home.root,
+      localSearch, localDetail: id => localCore.getTrace(id),
+      peerHandler: (req, res) => memoryAccess.peer(req, res) });
+    const refreshSync = async () => {
+      await syncStore?.close(); syncStore = undefined; remote!.setSync(undefined);
+      if (history!.config.remote.enabled && history!.config.remote.syncEnabled) {
+        syncStore = new PeerSyncStore({ home: home.root, dbPath: home.dbFile, nodeId: remote!.nodeId() });
+        await syncStore.open(); remote!.setSync(syncStore);
+      }
+    };
     history = new DshHistoryWorker({ home: home.root, profileId: config.profileId, core: localCore,
       bridge: backgroundBridge, route: () => settings.route(),
       withRoute: (route, operation) => routes.run(route, operation),
       validateModel: selection => settings.validate(selection),
       mcp: () => ({ enabled: !!viewer, url: viewer ? `${viewer.url}/mcp` : undefined }),
-      changed: async () => { await remote!.stop(); await remote!.start(); },
+      remoteStatus: () => remote!.snapshot(), connectRemote: () => remote!.connect(),
+      changed: async () => { await remote!.stop(); await remote!.initialize(); await refreshSync(); await remote!.start(); },
     });
     await history.load();
+    await remote.initialize();
+    await refreshSync();
     settings.history = history;
     core = federateMemoryCore(localCore, remote, () => history!.config.remote, id => history!.sourceFor(id));
     const tokenPath = join(home.root, ".codex-mcp.json");
@@ -325,7 +343,7 @@ export async function apply(
         fetch: id => core!.getTrace(id),
       }),
       peer: createMemoryPeerHandler({ core: localCore, config: () => history!.config.remote, profileId: config.profileId,
-        nodeId: process.platform === "win32" ? "local-dsh" : "nanopi" }),
+        remote, sync: () => syncStore }),
     };
     if (typeof ctx.inject === "function") registerMemorySettingsHttp(ctx as unknown as SettingsConnectionContext, settings);
 
@@ -507,6 +525,7 @@ export async function apply(
     viewerRetryController?.abort();
     await history?.stop();
     await remote?.stop();
+    await syncStore?.close();
     if (viewerRetryTask) await viewerRetryTask;
     if (viewer) {
       try {
@@ -529,6 +548,7 @@ export async function apply(
     viewerRetryController?.abort();
     await history?.stop();
     await remote?.stop();
+    await syncStore?.close();
     if (viewerRetryTask) await viewerRetryTask;
     if (viewer) {
       try {

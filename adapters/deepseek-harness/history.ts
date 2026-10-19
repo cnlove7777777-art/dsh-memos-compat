@@ -9,6 +9,7 @@ import { MemosError } from "../../agent-contract/errors.js";
 import { readHistoryFile, type HistoryTurn } from "./history-readers.js";
 import type { DeepSeekHarnessLlmRoute } from "./host-llm.js";
 import type { MemoryRemoteConfig } from "./remote.js";
+import { peerBaseUrl, validNodeId } from "./peer-protocol.js";
 
 export interface HistoryConfig {
   enabled: boolean;
@@ -27,12 +28,14 @@ export interface HistoryApi {
   snapshot(): Promise<unknown>;
   save(value: unknown): Promise<unknown>;
   run(value?: unknown): Promise<unknown>;
+  connect?(): Promise<unknown>;
 }
 export function defaultHistoryConfig(env = process.env): HistoryConfig {
   return { enabled: false,
     codexRoot: join(env["CODEX_HOME"] || join(homedir(), ".codex"), "sessions"),
     dshRoot: join(env["DSH_HOME"] || join(homedir(), ".dsh"), "sessions"),
-    recentDays: 7, remote: { enabled: false, url: "", tokenFile: "" } };
+    recentDays: 7, remote: { enabled: false, url: "", tokenFile: "", lanDiscovery: true,
+      peerPort: 18802, pollIntervalSeconds: 30, syncEnabled: false } };
 }
 function fail(message: string): never { throw new MemosError("invalid_argument", message); }
 export function parseHistoryConfig(value: unknown): HistoryConfig {
@@ -47,14 +50,14 @@ export function parseHistoryConfig(value: unknown): HistoryConfig {
     return fail("Explicit remote settings are required");
   }
   if (r.enabled) {
-    let u: URL;
-    try { u = new URL(r.url); } catch { return fail("Invalid remote URL"); }
-    if (u.username || u.password || u.search || u.hash || u.pathname !== "/" ||
-      !(u.protocol === "https:" || (u.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname)))) {
-      return fail("Use HTTPS or an explicit loopback SSH endpoint without credentials in its URL");
-    }
-    if (!r.tokenFile.trim()) return fail("Select the existing peer credential file");
+    if (r.url.trim()) { try { peerBaseUrl(r.url.trim()); } catch { return fail("Use an HTTPS server URL or private LAN address"); } }
+    if (!r.url.trim() && r.lanDiscovery === false) return fail("Enable LAN discovery or enter a server URL");
+    if (!r.tokenFile.trim() && !(typeof r.pairingKey === "string" && r.pairingKey.trim())) return fail("Set the peer pairing key");
   }
+  for (const field of ["nodeId", "expectedNodeId"] as const) if (r[field] !== undefined && r[field] !== "" && !validNodeId(r[field])) return fail("Invalid device identity");
+  if (r.peerPort !== undefined && (!Number.isInteger(r.peerPort) || Number(r.peerPort) < 1024 || Number(r.peerPort) > 65535)) return fail("Choose a peer port from 1024 to 65535");
+  if (r.pollIntervalSeconds !== undefined && (!Number.isInteger(r.pollIntervalSeconds) || Number(r.pollIntervalSeconds) < 15 || Number(r.pollIntervalSeconds) > 3600)) return fail("Choose a discovery interval from 15 to 3600 seconds");
+  for (const field of ["lanDiscovery", "syncEnabled"] as const) if (r[field] !== undefined && typeof r[field] !== "boolean") return fail("Invalid remote switch");
   let backgroundModel: HistoryConfig["backgroundModel"];
   if (v.backgroundModel) {
     const m = v.backgroundModel as Record<string, unknown>;
@@ -66,7 +69,11 @@ export function parseHistoryConfig(value: unknown): HistoryConfig {
   return { enabled: v.enabled, codexRoot: v.codexRoot.trim(), dshRoot: v.dshRoot.trim(),
     recentDays: Number(v.recentDays), ...(backgroundModel ? { backgroundModel } : {}),
     remote: { enabled: r.enabled, url: r.url.trim().replace(/\/$/, ""), tokenFile: r.tokenFile.trim(),
-      ...(typeof r.tunnelFile === "string" && r.tunnelFile.trim() ? { tunnelFile: r.tunnelFile.trim() } : {}) } };
+      lanDiscovery: r.lanDiscovery !== false, peerPort: Number(r.peerPort ?? 18802),
+      pollIntervalSeconds: Number(r.pollIntervalSeconds ?? 30), syncEnabled: r.syncEnabled === true,
+      ...(typeof r.nodeId === "string" && r.nodeId ? { nodeId: r.nodeId } : {}),
+      ...(typeof r.expectedNodeId === "string" && r.expectedNodeId ? { expectedNodeId: r.expectedNodeId } : {}),
+      ...(typeof r.sessionFile === "string" && r.sessionFile.trim() ? { sessionFile: r.sessionFile.trim() } : {}) } };
 }
 
 export async function atomicHistoryJson(path: string, value: unknown): Promise<void> {
@@ -105,6 +112,8 @@ export class DshHistoryWorker implements HistoryApi {
     validateModel: (route: { mode: "fixed"; provider: string; model: string }) => Promise<void>;
     mcp: () => { enabled: boolean; url?: string };
     changed?: () => Promise<void>;
+    remoteStatus?: () => unknown;
+    connectRemote?: () => Promise<unknown>;
     reader?: typeof readHistoryFile;
     maxTurns?: number;
   }) { this.config = defaultHistoryConfig(); }
@@ -148,13 +157,31 @@ export class DshHistoryWorker implements HistoryApi {
     await this.writes.catch(() => undefined);
   }
   async snapshot() {
-    return { config: structuredClone(this.config), status: { ...this.status }, mcp: this.options.mcp() };
+    const config = structuredClone(this.config);
+    config.remote.hasPairingKey = !!config.remote.tokenFile;
+    config.remote.hasSession = !!config.remote.sessionFile;
+    return { config, status: { ...this.status }, mcp: this.options.mcp(), remote: this.options.remoteStatus?.() };
   }
+  async connect() { await this.options.connectRemote?.(); return this.snapshot(); }
   async save(value: unknown) {
     const config = parseHistoryConfig(value);
     const pending = this.writes.catch(() => undefined).then(async () => {
       if (this.stopped) throw new Error("History worker stopped");
       if (config.backgroundModel) await this.options.validateModel({ mode: "fixed", ...config.backgroundModel });
+      const rawRemote = (value as { remote: Record<string, unknown> }).remote;
+      const pairingKey = typeof rawRemote.pairingKey === "string" ? rawRemote.pairingKey.trim() : "";
+      const session = typeof rawRemote.session === "string" ? rawRemote.session.trim() : "";
+      if (pairingKey && (pairingKey.length < 32 || pairingKey.length > 512 || /\s/.test(pairingKey))) return fail("Use a pairing key of 32 to 512 characters without spaces");
+      if (session && (session.length > 4096 || /\s/.test(session))) return fail("Invalid server login session");
+      if (pairingKey || session) {
+        let token: string | undefined, previousSession: string | undefined;
+        try { token = JSON.parse(await fs.readFile(config.remote.tokenFile, "utf8")).token; } catch { /* A new key may be supplied. */ }
+        try { previousSession = JSON.parse(await fs.readFile(config.remote.sessionFile || "", "utf8")).session; } catch { /* First remote login. */ }
+        const credentialFile = join(this.options.home, ".peer-credentials.json");
+        await atomicHistoryJson(credentialFile, { token: pairingKey || token, session: session || previousSession });
+        config.remote.tokenFile = credentialFile;
+        if (session || previousSession) config.remote.sessionFile = credentialFile;
+      }
       this.priorityPaths = undefined;
       this.controller?.abort();
       await this.pending;

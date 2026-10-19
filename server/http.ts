@@ -99,7 +99,7 @@ export async function startHttpServer(
         await deps.memoryAccess.mcp(req, res);
         return;
       }
-      if (deps.memoryAccess && ["/peer/health", "/peer/search", "/peer/detail"].includes(accessPath)) {
+      if (deps.memoryAccess && accessPath.startsWith("/peer/")) {
         await deps.memoryAccess.peer(req, res);
         return;
       }

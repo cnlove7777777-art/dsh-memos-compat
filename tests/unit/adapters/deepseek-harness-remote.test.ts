@@ -1,706 +1,154 @@
-import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type Server } from "node:http";
+import { mkdtemp, writeFile, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-
-import type { RetrievalQueryDTO } from "../../../agent-contract/dto.js";
-import type { MemoryCore } from "../../../agent-contract/memory-core.js";
-import {
-  DshRemoteMemory,
-  readPeerToken,
-} from "../../../adapters/deepseek-harness/remote.js";
+import { DshRemoteMemory, readPeerToken } from "../../../adapters/deepseek-harness/remote.js";
 import { createMemoryPeerHandler } from "../../../adapters/deepseek-harness/shared-memory.js";
+import { PeerReplayGuard, signPeerRequest, peerUrl, peerBaseUrl, handshakeProof, PEER_PROTOCOL } from "../../../adapters/deepseek-harness/peer-protocol.js";
+import { PeerRelay } from "../../../adapters/deepseek-harness/peer-relay.js";
+import type { MemoryCore } from "../../../agent-contract/memory-core.js";
+import type { MemoryRemoteConfig } from "../../../adapters/deepseek-harness/remote.js";
 
-const homes: string[] = [];
-const servers: Server[] = [];
-
-afterEach(async () => {
-  await Promise.all(servers.splice(0).map(server => new Promise<void>((resolve) => {
-    server.closeAllConnections();
-    server.close(() => resolve());
-  })));
-  await Promise.all(homes.splice(0).map(home =>
-    rm(home, { recursive: true, force: true })));
-});
-
-async function tempHome(): Promise<string> {
-  const home = await mkdtemp(join(tmpdir(), "memos-remote-"));
-  homes.push(home);
-  return home;
+const cleanups: Array<() => unknown> = [];
+const key = "synthetic-paired-key-abcdefghijklmnopqrstuvwxyz";
+const query = { agent: "deepseek-harness", query: "previous project" };
+const trace = { id: "tr-real", episodeId: "ep-real", sessionId: "session-real", ts: 1700000000000,
+  userText: "user", agentText: "answer", toolCalls: [], value: .5, alpha: .5, priority: .5, turnId: 1 };
+const result = { query, hits: [{ tier: 2, refKind: "trace", refId: trace.id, score: .9, snippet: "previous project memory" }],
+  injectedContext: "previous project memory", tierLatencyMs: { tier1: 0, tier2: 1, tier3: 0 } };
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+async function home() {
+  const path = await mkdtemp(join(tmpdir(), "memos-network-")); cleanups.push(() => rm(path, { recursive: true, force: true }));
+  const tokenFile = join(path, "key.json"); await writeFile(tokenFile, JSON.stringify({ token: key, session: "synthetic-webos-session" }));
+  return { path, tokenFile };
+}
+async function listen(handler: Parameters<typeof createServer>[0]): Promise<{ server: Server; url: string; port: number }> {
+  const server = createServer(handler); await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }));
+  const port = (server.address() as { port: number }).port; return { server, port, url: `http://127.0.0.1:${port}` };
+}
+async function paired() {
+  const { path, tokenFile } = await home();
+  const serverConfig: MemoryRemoteConfig = { enabled: true, url: "", tokenFile, nodeId: "server", expectedNodeId: "desktop", lanDiscovery: false };
+  const serverRemote = new DshRemoteMemory({ config: () => serverConfig, localPort: 18801, home: join(path, "server") });
+  const searchMemory = vi.fn().mockResolvedValue(result), getTrace = vi.fn().mockResolvedValue(trace);
+  const handler = createMemoryPeerHandler({ core: { searchMemory, getTrace } as unknown as MemoryCore,
+    config: () => serverConfig, profileId: "nanopi", remote: serverRemote });
+  const endpoint = await listen((req, res) => { void handler(req, res); });
+  const desktopConfig: MemoryRemoteConfig = { enabled: true, url: endpoint.url, tokenFile, nodeId: "desktop", expectedNodeId: "server", lanDiscovery: false };
+  const desktop = new DshRemoteMemory({ config: () => desktopConfig, localPort: 18801, home: join(path, "desktop"),
+    localSearch: async () => ({ ...result, injectedContext: "desktop source" }) as never,
+    localDetail: async () => trace });
+  cleanups.push(() => serverRemote.stop()); cleanups.push(() => desktop.stop());
+  await serverRemote.start(); await desktop.start(); await desktop.connect();
+  return { endpoint, serverRemote, desktop, searchMemory, getTrace, tokenFile };
 }
 
-async function tokenFile(home: string, token = "peer-test-token"): Promise<string> {
-  const path = join(home, "peer-token.json");
-  await writeFile(path, JSON.stringify({ token }));
-  return path;
-}
-
-function query(text = "peer lookup"): RetrievalQueryDTO {
-  return {
-    agent: "deepseek-harness",
-    query: text,
-    topK: { tier1: 2, tier2: 3, tier3: 4 },
-  };
-}
-
-function traceDto(id = "trace-1") {
-  return {
-    id,
-    episodeId: "episode-1",
-    sessionId: "session-1",
-    ts: 1_700_000_000_000,
-    userText: "user",
-    agentText: "agent",
-    toolCalls: [],
-    value: 0.5,
-    alpha: 0.5,
-    priority: 0.5,
-    turnId: 1_700_000_000_000,
-  };
-}
-
-async function listen(
-  handler: (req: IncomingMessage, body: Buffer, res: import("node:http").ServerResponse) => void,
-): Promise<{ url: string; port: number; requests: Array<{
-  method?: string;
-  url?: string;
-  authorization?: string;
-  body: Buffer;
-}> }> {
-  const requests: Array<{
-    method?: string;
-    url?: string;
-    authorization?: string;
-    body: Buffer;
-  }> = [];
-  const server = createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on("data", chunk => chunks.push(Buffer.from(chunk)));
-    req.on("end", () => {
-      const body = Buffer.concat(chunks);
-      requests.push({
-        method: req.method,
-        url: req.url,
-        authorization: req.headers.authorization,
-        body,
-      });
-      handler(req, body, res);
-    });
-  });
-  servers.push(server);
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("No test port");
-  return {
-    url: `http://127.0.0.1:${address.port}`,
-    port: address.port,
-    requests,
-  };
-}
-
-function json(
-  res: import("node:http").ServerResponse,
-  status: number,
-  value: unknown,
-): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(value));
-}
-
-describe("readPeerToken", () => {
-  it("reads the token without exposing it in errors", async () => {
-    const home = await tempHome();
-    const path = await tokenFile(home, "secret-token-value");
-    await expect(readPeerToken(path)).resolves.toBe("secret-token-value");
-    await writeFile(path, "{broken secret-token-value");
-    const error = await readPeerToken(path).catch(value => value as Error);
-    expect(error).toBeInstanceOf(Error);
-    expect(String(error)).not.toContain("secret-token-value");
-  });
-});
-
-describe("DshRemoteMemory", () => {
-  it("searches with auth and prefixes remote hits", async () => {
-    const home = await tempHome();
-    const peer = await listen((req, body, res) => {
-      expect(req.method).toBe("POST");
-      expect(req.headers.authorization).toBe("Bearer peer-test-token");
-      const payload = JSON.parse(body.toString("utf8"));
-      expect(payload).toEqual({
-        query: "peer lookup",
-        topK: { tier1: 2, tier2: 3, tier3: 4 },
-      });
-      json(res, 200, {
-        hits: [{
-          tier: 2,
-          refKind: "trace",
-          refId: "tr-peer",
-          score: 0.8,
-          snippet: "Peer memory body",
-        }],
-        injectedContext: "peer context",
-        tierLatencyMs: { tier1: 1, tier2: 2, tier3: 3 },
-      });
-    });
-    const tokenPath = await tokenFile(home);
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: peer.url,
-        tokenFile: tokenPath,
-      }),
-    });
-    const result = await remote.search(query());
-    expect(peer.requests).toHaveLength(1);
-    expect(result.hits).toEqual([expect.objectContaining({
-      refId: "remote~tr-peer",
-      snippet: "[Remote peer] Peer memory body",
-    })]);
-    expect(result.injectedContext).toBe("peer context");
-    expect(result.query.query).toBe("peer lookup");
-  });
-
-  it("fetches trace details through the encoded peer path", async () => {
-    const home = await tempHome();
-    const peer = await listen((_req, _body, res) => {
-      json(res, 200, { trace: traceDto("trace/with space") });
-    });
-    const tokenPath = await tokenFile(home);
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: peer.url,
-        tokenFile: tokenPath,
-      }),
-    });
-    const detail = await remote.getTrace("trace/with space");
-    expect(detail).toMatchObject({ id: "trace/with space", toolCalls: [] });
-    const expected = encodeURIComponent(
-      `/api/v1/memory/trace?id=${encodeURIComponent("trace/with space")}`,
-    );
-    expect(peer.requests[0]?.url).toBe(`/peer/detail?path=${expected}`);
-  });
-
-  it("throws safe errors for auth failure, malformed JSON, and redirects", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const unauthorized = await listen((_req, _body, res) => {
-      json(res, 401, { error: { message: "secret server detail" } });
-    });
-    const malformed = await listen((_req, _body, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end("{not-json");
-    });
-    const redirect = await listen((_req, _body, res) => {
-      res.writeHead(302, { Location: "http://example.com/" });
-      res.end();
-    });
-
-    for (const [url, message] of [
-      [unauthorized.url, /authentication/i],
-      [malformed.url, /invalid JSON/i],
-      [redirect.url, /redirect/i],
-    ] as const) {
-      const remote = new DshRemoteMemory({
-        localPort: 18_801,
-        config: () => ({ enabled: true, url, tokenFile: tokenPath }),
-      });
-      const error = await remote.search(query()).catch(value => value as Error);
-      expect(error).toBeInstanceOf(Error);
-      expect(error.message).toMatch(message);
-      expect(error.message).not.toContain("secret server detail");
+describe("peer protocol and credential boundaries", () => {
+  it("retains a public gateway path and rejects public cleartext or credential URLs", () => {
+    expect(peerUrl("https://example.test/desktop/api/memory-peer", "/peer/sync/pull").href)
+      .toBe("https://example.test/desktop/api/memory-peer/sync/pull");
+    expect(peerUrl("http://192.168.76.1:18802", "/peer/detail").pathname).toBe("/peer/detail");
+    for (const url of ["http://example.test", "https://user:secret@example.test", "https://example.test/?session=secret", "https://example.test/arbitrary"]) {
+      expect(() => peerBaseUrl(url)).toThrow();
     }
   });
-
-  it("enforces an earlier deadline and the response limit", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const slow = await listen((_req, _body, res) => {
-      setTimeout(() => json(res, 200, { hits: [] }), 1_000);
-    });
-    const huge = await listen((_req, _body, res) => {
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Content-Length": String(1024 * 1024 + 1),
-      });
-      res.end();
-    });
-
-    const slowRemote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({ enabled: true, url: slow.url, tokenFile: tokenPath }),
-    });
-    const slowError = await slowRemote.search({
-      ...query(),
-      deadlineAt: Date.now() + 80,
-    }).catch(value => value as Error);
-    expect(slowError.message).toMatch(/timed out/i);
-
-    const hugeRemote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({ enabled: true, url: huge.url, tokenFile: tokenPath }),
-    });
-    const hugeError = await hugeRemote.search(query()).catch(value => value as Error);
-    expect(hugeError.message).toMatch(/too large/i);
+  it("rejects replay, tampered bodies, expired signatures and another node", () => {
+    const now = Date.now(); const guard = new PeerReplayGuard();
+    const signed = signPeerRequest(key, "desktop", "POST", "/peer/search", "{}", now);
+    const headers = Object.fromEntries(Object.entries(signed).map(([k, v]) => [k.toLowerCase(), v]));
+    expect(guard.verify(key, "POST", "/peer/search", "changed", headers, "desktop", now)).toBeUndefined();
+    expect(guard.verify(key, "POST", "/peer/search", "{}", headers, "other", now)).toBeUndefined();
+    expect(guard.verify(key, "POST", "/peer/search", "{}", headers, "desktop", now + 61000)).toBeUndefined();
+    expect(guard.verify(key, "POST", "/peer/search", "{}", headers, "desktop", now)).toBe("desktop");
+    expect(guard.verify(key, "POST", "/peer/search", "{}", headers, "desktop", now)).toBeUndefined();
   });
-
-  it("rejects non-loopback HTTP URLs and remote writes are absent", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: "http://example.com",
-        tokenFile: tokenPath,
-      }),
-    });
-    await expect(remote.search(query())).rejects.toThrow(/URL is invalid/i);
-    expect("write" in remote).toBe(false);
+  it("keeps malformed credential contents out of errors", async () => {
+    const { tokenFile } = await home(); expect(await readPeerToken(tokenFile)).toBe(key);
+    await writeFile(tokenFile, "broken " + key);
+    await expect(readPeerToken(tokenFile)).rejects.toThrow("Peer credential could not be read");
   });
-
-  it("reuses an existing tunnel without spawning SSH and checks health with auth", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const tunnelPath = join(home, "tunnel.json");
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "id_ed25519",
-      known_hosts: "known_hosts",
-      last_address: "root@192.0.2.1",
-    }));
-    const spawn = vi.fn();
-    const health = vi.fn(async () => new Response(JSON.stringify({
-      protocol: "saya-memory/1",
-      node_id: "nanopi",
-      engine: { ok: true },
-      database_sync: false,
-    }), { status: 200 }));
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: "https://peer.example.com",
-        tokenFile: tokenPath,
-        tunnelFile: tunnelPath,
-      }),
-      spawn: spawn as never,
-      fetch: health as never,
+  it("sends neither bearer nor login session on a LAN HTTP connection", async () => {
+    const { tokenFile } = await home(); const fetchMock = vi.fn(async (_url, init) => {
+      const headers = init.headers;
+      expect(headers.Authorization).toBeUndefined(); expect(headers["X-WebOS-Session"]).toBeUndefined();
+      expect(headers["X-Memory-Signature"]).toMatch(/^[a-f0-9]{64}$/);
+      return Response.json(result);
     });
-
-    await remote.start();
-    expect(spawn).not.toHaveBeenCalled();
-    expect(health).toHaveBeenCalledWith(
-      "http://127.0.0.1:18794/peer/health",
-      expect.objectContaining({
-        headers: { Authorization: "Bearer peer-test-token" },
-        redirect: "error",
-      }),
-    );
-    await remote.stop();
+    const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,
+      url: "http://192.168.76.1:18802", tokenFile, sessionFile: tokenFile, nodeId: "desktop" }), fetch: fetchMock as never });
+    expect((await client.search(query)).hits[0].refId).toBe("remote~tr-real");
   });
-
-  it("does not reuse 18794 when it identifies as the local DSH node", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const tunnelPath = join(home, "tunnel.json");
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "id_ed25519",
-      known_hosts: "known_hosts",
-      last_address: "root@192.0.2.1",
-    }));
-    const child = new EventEmitter() as EventEmitter & {
-      kill: ReturnType<typeof vi.fn>;
-      exitCode: number | null;
-      signalCode: NodeJS.Signals | null;
-    };
-    child.kill = vi.fn(() => true);
-    child.exitCode = null;
-    child.signalCode = null;
-    const spawn = vi.fn(() => {
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
+  it("scopes a configured login session to the exact HTTPS gateway origin", async () => {
+    const { tokenFile } = await home(); const fetchMock = vi.fn(async (url, init) => {
+      expect(String(url)).toBe("https://example.test/desktop/api/memory-peer/search");
+      expect(init.headers.Authorization).toBe(`Bearer ${key}`);
+      expect(init.headers["X-WebOS-Session"]).toBe("synthetic-webos-session"); expect(init.redirect).toBe("error");
+      return Response.json(result);
     });
-    const health = vi.fn(async () => new Response(JSON.stringify({
-      protocol: "saya-memory/1",
-      node_id: "local-dsh",
-      engine: { ok: true },
-      database_sync: false,
-    }), { status: 200 }));
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: "https://peer.example.com",
-        tokenFile: tokenPath,
-        tunnelFile: tunnelPath,
-      }),
-      spawn: spawn as never,
-      fetch: health as never,
-    });
-
-    await remote.start();
-    expect(spawn).toHaveBeenCalledOnce();
-    await remote.stop();
+    const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,
+      url: "https://example.test/desktop/api/memory-peer", tokenFile, sessionFile: tokenFile }), fetch: fetchMock as never });
+    await client.search(query); expect(fetchMock).toHaveBeenCalledOnce();
   });
-
-  it("supports stop then start for settings changes", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const tunnelPath = join(home, "tunnel.json");
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "id_ed25519",
-      known_hosts: "known_hosts",
-      last_address: "root@192.0.2.1",
-    }));
-    const children: Array<EventEmitter & {
-      kill: ReturnType<typeof vi.fn>;
-      exitCode: number | null;
-      signalCode: NodeJS.Signals | null;
-    }> = [];
-    const spawn = vi.fn(() => {
-      const child = new EventEmitter() as EventEmitter & {
-        kill: ReturnType<typeof vi.fn>;
-        exitCode: number | null;
-        signalCode: NodeJS.Signals | null;
-      };
-      child.kill = vi.fn(() => true);
-      child.exitCode = null;
-      child.signalCode = null;
-      children.push(child);
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
-    });
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: "https://peer.example.com",
-        tokenFile: tokenPath,
-        tunnelFile: tunnelPath,
-      }),
-      spawn: spawn as never,
-      fetch: vi.fn(async () => {
-        throw new Error("not running");
-      }) as never,
-    });
-
-    await remote.start();
-    await remote.stop();
-    await remote.start();
-    expect(spawn).toHaveBeenCalledTimes(2);
-    expect(children[0]!.kill).toHaveBeenCalled();
-    await remote.stop();
-    expect(children[1]!.kill).toHaveBeenCalled();
+  it("rejects oversized responses and preserves caller cancellation", async () => {
+    const { tokenFile } = await home(); const config = () => ({ enabled: true, url: "http://127.0.0.1:18802", tokenFile });
+    const oversized = new DshRemoteMemory({ localPort: 18801, config, fetch: vi.fn(async () => new Response("{}", {
+      headers: { "Content-Length": "1048577" } })) as never });
+    await expect(oversized.search(query)).rejects.toThrow(/large/);
+    const controller = new AbortController(); controller.abort();
+    const cancelled = new DshRemoteMemory({ localPort: 18801, config });
+    await expect(cancelled.search(query, controller.signal)).rejects.toThrow();
   });
+});
 
-  it("honors an earlier query deadline and still caps at 1800ms", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const peer = await listen((_req, _body, res) => {
-      setTimeout(() => json(res, 200, {
-        hits: [],
-        injectedContext: "",
-        tierLatencyMs: { tier1: 0, tier2: 0, tier3: 0 },
-      }), 1_000);
-    });
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({ enabled: true, url: peer.url, tokenFile: tokenPath }),
-    });
-    const started = Date.now();
-    const error = await remote.search({
-      ...query(),
-      deadlineAt: Date.now() + 80,
-    }).catch(value => value as Error);
-    expect(error.message).toMatch(/timed out/i);
-    expect(Date.now() - started).toBeLessThan(800);
+describe("real HTTP peer routes", () => {
+  it("mutually handshakes, remembers identity and queries only the peer local core", async () => {
+    const { desktop, searchMemory, getTrace } = await paired();
+    expect(desktop.snapshot()).toMatchObject({ state: "connected", nodeId: "server" });
+    expect((await desktop.search(query)).hits[0].refId).toBe("remote~tr-real");
+    expect(await desktop.getTrace(trace.id)).toEqual(trace);
+    expect(searchMemory.mock.calls[0][0].namespace.profileId).toBe("nanopi"); expect(getTrace).toHaveBeenCalledWith(trace.id);
   });
-
-  it("uses the 2800ms search cap while keeping detail below 2000ms", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const observed: Array<{ path: string; started: number }> = [];
-    const peer = await listen((req, _body, res) => {
-      observed.push({ path: req.url ?? "", started: Date.now() });
-      // The request is aborted by the client's own timeout before this
-      // delayed response can be used. The test only needs to observe that
-      // search is still pending beyond the old 1800ms cap.
-      setTimeout(() => json(res, 200, {
-        hits: [],
-        injectedContext: "",
-        tierLatencyMs: { tier1: 0, tier2: 0, tier3: 0 },
-      }), 2_100);
-    });
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({ enabled: true, url: peer.url, tokenFile: tokenPath }),
-    });
-
-    const started = Date.now();
-    const result = await remote.search(query());
-    expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
-    expect(result.hits).toEqual([]);
-    expect(observed[0]?.path).toBe("/peer/search");
+  it("returns reverse queries over the desktop outbound long poll, without a desktop listener", async () => {
+    const { desktop, serverRemote } = await paired();
+    await vi.waitFor(() => expect(serverRemote.relay.peer()).toBe("desktop"));
+    const answer = await serverRemote.search(query); expect(answer.injectedContext).toBe("desktop source");
+    expect(await serverRemote.getTrace(trace.id)).toEqual(trace); await desktop.stop();
+    expect(desktop.snapshot().state).toBe("disabled");
   });
-
-  it("starts SSH with explicit forwarding arguments and no shell", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const tunnelPath = join(home, "tunnel.json");
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "private/id_ed25519",
-      known_hosts: "private/known_hosts",
-      last_address: "192.0.2.1",
-    }));
-    const child = new EventEmitter() as EventEmitter & {
-      kill: ReturnType<typeof vi.fn>;
-      exitCode: number | null;
-      signalCode: NodeJS.Signals | null;
-    };
-    child.kill = vi.fn(() => true);
-    child.exitCode = null;
-    child.signalCode = null;
-    const spawn = vi.fn(() => {
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
-    });
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: "https://peer.example.com",
-        tokenFile: tokenPath,
-        tunnelFile: tunnelPath,
-      }),
-      spawn: spawn as never,
-      fetch: vi.fn(async () => {
-        throw new Error("not running");
-      }) as never,
-    });
-
-    await remote.start();
-    expect(spawn).toHaveBeenCalledOnce();
-    const [command, args, options] = spawn.mock.calls[0]!;
-    expect(command).toBe("ssh");
-    expect(args).toEqual([
-      "-N", "-T",
-      "-o", "BatchMode=yes",
-      "-o", "IdentitiesOnly=yes",
-      "-o", "ConnectTimeout=6",
-      "-o", "ExitOnForwardFailure=yes",
-      "-o", "ServerAliveInterval=15",
-      "-o", "ServerAliveCountMax=2",
-      "-o", "StrictHostKeyChecking=yes",
-      "-o", `UserKnownHostsFile=${join(home, "private", "known_hosts")}`,
-      "-o", "HostKeyAlias=nanopi-m4v2",
-      "-i", join(home, "private", "id_ed25519"),
-      "-L", "127.0.0.1:18794:127.0.0.1:18801",
-      "-R", "127.0.0.1:18793:127.0.0.1:18801",
-      "root@192.0.2.1",
-    ]);
-    expect(options).toMatchObject({
-      shell: false,
-      windowsHide: true,
-      stdio: "ignore",
-    });
-    await remote.stop();
-    expect(child.kill).toHaveBeenCalled();
+  it("requires signed auth for handshake, sync and reverse routes; never serves settings", async () => {
+    const { endpoint } = await paired();
+    for (const route of ["handshake", "sync/pull", "relay/poll"]) {
+      const response = await fetch(`${endpoint.url}/peer/${route}`, { method: "POST", headers: {
+        Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: "{}" });
+      expect(response.status).toBe(401);
+    }
+    expect((await fetch(`${endpoint.url}/api/v1/config`)).status).toBe(404);
+    const body = JSON.stringify({ query: "project" });
+    const signed = signPeerRequest(key, "desktop", "POST", "/peer/search", body);
+    const request = () => fetch(`${endpoint.url}/peer/search`, { method: "POST", headers: { ...signed, "Content-Type": "application/json" }, body });
+    expect((await request()).status).toBe(200); expect((await request()).status).toBe(401);
   });
-
-  it("guards late SSH spawns after disposal", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const tunnelPath = join(home, "tunnel.json");
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "id_ed25519",
-      known_hosts: "known_hosts",
-      last_address: "root@192.0.2.1",
-    }));
-    const child = new EventEmitter() as EventEmitter & {
-      kill: ReturnType<typeof vi.fn>;
-      exitCode: number | null;
-      signalCode: NodeJS.Signals | null;
-    };
-    child.kill = vi.fn(() => true);
-    child.exitCode = null;
-    child.signalCode = null;
-    let releaseSpawn!: () => void;
-    const spawnGate = new Promise<void>(resolve => { releaseSpawn = resolve; });
-    let spawned = false;
-    const spawn = vi.fn(() => {
-      void spawnGate.then(() => {
-        spawned = true;
-        child.emit("spawn");
-      });
-      return child;
-    });
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: "https://peer.example.com",
-        tokenFile: tokenPath,
-        tunnelFile: tunnelPath,
-      }),
-      spawn: spawn as never,
-      fetch: vi.fn(async () => {
-        throw new Error("not running");
-      }) as never,
-    });
-
-    const starting = remote.start();
-    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-    await remote.stop();
-    expect(spawned).toBe(false);
-    releaseSpawn();
-    await starting;
-    expect(child.kill).toHaveBeenCalled();
+  it("verifies challenge proof instead of trusting a health status or discovery announcement", async () => {
+    const { tokenFile } = await home();
+    const fake = await listen((req, res) => { req.resume(); res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({
+      protocol: PEER_PROTOCOL, node_id: "server", proof: handshakeProof("wrong-key", "wrong-challenge", "server") })); });
+    const remote = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true, url: fake.url,
+      tokenFile, lanDiscovery: false, nodeId: "desktop" }) });
+    cleanups.push(() => remote.stop()); await remote.start(); expect((await remote.connect()).state).toBe("offline");
   });
+});
 
-  it("accepts user/username overrides and rejects malformed SSH users", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const tunnelPath = join(home, "tunnel.json");
-    const children: Array<EventEmitter & {
-      kill: ReturnType<typeof vi.fn>;
-      exitCode: number | null;
-      signalCode: NodeJS.Signals | null;
-    }> = [];
-    const spawn = vi.fn(() => {
-      const child = new EventEmitter() as EventEmitter & {
-        kill: ReturnType<typeof vi.fn>;
-        exitCode: number | null;
-        signalCode: NodeJS.Signals | null;
-      };
-      child.kill = vi.fn(() => true);
-      child.exitCode = null;
-      child.signalCode = null;
-      children.push(child);
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
-    });
-    const makeRemote = (tunnel: Record<string, unknown>) => new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: "https://peer.example.com",
-        tokenFile: tokenPath,
-        tunnelFile: tunnelPath,
-      }),
-      spawn: spawn as never,
-      fetch: vi.fn(async () => {
-        throw new Error("not running");
-      }) as never,
-    });
-
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "id_ed25519",
-      known_hosts: "known_hosts",
-      last_address: "192.0.2.1",
-      user: "ubuntu",
-    }));
-    const userRemote = makeRemote({});
-    await userRemote.start();
-    expect(spawn.mock.calls[0]?.[1]).toContain("ubuntu@192.0.2.1");
-    await userRemote.stop();
-
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "id_ed25519",
-      known_hosts: "known_hosts",
-      last_address: "192.0.2.1",
-      username: "admin",
-    }));
-    const usernameRemote = makeRemote({});
-    await usernameRemote.start();
-    expect(spawn.mock.calls[1]?.[1]).toContain("admin@192.0.2.1");
-    await usernameRemote.stop();
-
-    await writeFile(tunnelPath, JSON.stringify({
-      identity: "id_ed25519",
-      known_hosts: "known_hosts",
-      last_address: "192.0.2.1",
-      user: "-oProxyCommand=bad",
-    }));
-    await expect(makeRemote({}).start()).rejects.toThrow(/invalid/i);
-    expect(spawn).toHaveBeenCalledTimes(2);
-  });
-
-  it("works against the real parent peer routes end to end", async () => {
-    const home = await tempHome();
-    const tokenPath = await tokenFile(home);
-    const trace = traceDto("trace-real-route");
-    const core = {
-      getTrace: vi.fn(async (id: string) => id === trace.id ? trace : null),
-      searchMemory: vi.fn(async (query: RetrievalQueryDTO) => ({
-        query,
-        hits: [{
-          tier: 2 as const,
-          refKind: "trace" as const,
-          refId: trace.id,
-          score: 0.77,
-          snippet: "Real route memory",
-        }],
-        injectedContext: "real route context",
-        tierLatencyMs: { tier1: 0, tier2: 3, tier3: 0 },
-      })),
-    } as unknown as MemoryCore;
-    const peer = createMemoryPeerHandler({
-      core,
-      config: () => ({
-        enabled: true,
-        url: "https://peer.example.com",
-        tokenFile: tokenPath,
-      }),
-      profileId: "test-profile",
-    });
-    const server = createServer((req, res) => {
-      void peer(req, res).catch(() => {
-        if (!res.headersSent) res.writeHead(500);
-        res.end();
-      });
-    });
-    servers.push(server);
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => resolve());
-    });
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("No route port");
-    const remote = new DshRemoteMemory({
-      localPort: 18_801,
-      config: () => ({
-        enabled: true,
-        url: `http://127.0.0.1:${address.port}`,
-        tokenFile: tokenPath,
-      }),
-    });
-
-    expect(await remote.health(address.port, "peer-test-token")).toMatchObject({
-      node_id: "local-dsh",
-      engine: { ok: true },
-    });
-    const result = await remote.search({
-      ...query("real route query"),
-      deadlineAt: Date.now() + 2_800,
-    });
-    expect(result.hits[0]).toMatchObject({
-      refId: `remote~${trace.id}`,
-      snippet: "[Remote peer] Real route memory",
-    });
-    expect(await remote.getTrace(trace.id)).toMatchObject({
-      id: trace.id,
-      toolCalls: [],
-    });
-    expect(core.searchMemory).toHaveBeenCalledWith(
-      expect.objectContaining({ query: "real route query" }),
-      expect.anything(),
-    );
+describe("reverse queue", () => {
+  it("restricts results to their authenticated peer and cancels on shutdown", async () => {
+    const relay = new PeerRelay(); const poll = relay.poll("desktop");
+    const pending = relay.request("detail", { id: "trace" });
+    const commands = await poll;
+    relay.results("other", [{ id: commands[0].id, ok: true, value: "forged" }]);
+    relay.results("desktop", [{ id: commands[0].id, ok: true, value: "real" }]);
+    expect(await pending).toBe("real");
+    const cancelled = relay.request("search", { query: "project" });
+    const rejection = expect(cancelled).rejects.toThrow("Peer stopped"); relay.stop(); await rejection;
   });
 });

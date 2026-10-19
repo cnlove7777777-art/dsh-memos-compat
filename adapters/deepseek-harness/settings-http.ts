@@ -1,7 +1,7 @@
 import type { MemorySettingsApi } from "./settings.js";
 import { MemosError } from "../../agent-contract/errors.js";
 
-export const DSH_MEMORY_PATHS = ["/api/memos/settings", "/api/memos/test", "/api/memos/embedding-test", "/api/memos/history", "/api/memos/history-run"];
+export const DSH_MEMORY_PATHS = ["/api/memos/settings", "/api/memos/test", "/api/memos/embedding-test", "/api/memos/history", "/api/memos/history-run", "/api/memos/history/connect"];
 
 export async function handleMemorySettingsRequest(api: MemorySettingsApi, request: Request): Promise<Response> {
   const url = new URL(request.url);
@@ -10,7 +10,8 @@ export async function handleMemorySettingsRequest(api: MemorySettingsApi, reques
     status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
   });
   try {
-    if ((action === "history" || action === "history-run") && !api.history) return respond(404, { error: { message: "History worker unavailable" } });
+    if ((action === "history" || action === "history-run" || action === "connect") && !api.history) return respond(404, { error: { message: "History worker unavailable" } });
+    if (action === "connect" && request.method === "POST") return respond(200, await api.history!.connect?.());
     if (action === "history" && request.method === "GET") return respond(200, await api.history!.snapshot());
     if (action === "history" && request.method === "PUT") return respond(200, await api.history!.save(await request.json()));
     if (action === "history-run" && request.method === "POST") {
