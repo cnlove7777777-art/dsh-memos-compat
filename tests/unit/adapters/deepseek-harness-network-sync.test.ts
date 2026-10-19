@@ -34,7 +34,8 @@ it("synchronizes different DSH profiles bidirectionally and recalls a persisted 
   const server = new DshRemoteMemory({ config: () => serverConfig, localPort: 18801, profileId: "nanopi", sync: serverStore });
   cleanups.push(() => server.stop());
   const handler = createMemoryPeerHandler({ core: {} as MemoryCore, config: () => serverConfig, profileId: "nanopi", remote: server, sync: () => serverStore });
-  const listener = createServer((req, res) => { void handler(req, res); });
+  const userAgents: Array<string | undefined> = [];
+  const listener = createServer((req, res) => { userAgents.push(req.headers["user-agent"]); void handler(req, res); });
   await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
   const close = () => new Promise<void>(resolve => { listener.close(() => resolve()); listener.closeAllConnections(); });
   cleanups.push(close);
@@ -43,6 +44,8 @@ it("synchronizes different DSH profiles bidirectionally and recalls a persisted 
   const desktop = new DshRemoteMemory({ config: () => config, localPort: 18801, profileId: "desktop", sync: desktopStore,
     embedQuery: async () => ({ model, values: [1, 0, 0] }) });
   cleanups.push(() => desktop.stop()); await server.start(); await desktop.start(); await desktop.connect();
+  expect(userAgents.length).toBeGreaterThan(0);
+  expect(userAgents.every(value => value === "MemOS-DSH/2")).toBe(true);
   expect(desktop.snapshot()).toMatchObject({ state: "connected", sync: { replicas: { trace: 1 }, vectors: 1 } });
   expect(serverStore.stats()).toMatchObject({ replicas: { trace: 1 }, vectors: 1, sourceProfiles: ["desktop"] });
   expect(desktopStore.stats().sourceProfiles).toEqual(["nanopi"]);

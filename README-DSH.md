@@ -51,12 +51,12 @@ From a DSH profile directory, the GitHub default branch can be installed with:
 dsh plugin --profile <name> add cnlove7777777-art/dsh-memos-compat
 ```
 
-For the `2.0.16-dsh.6` candidate on `feat/dsh-peer-network-20261019`, build
+For the `2.0.16-dsh.7` candidate on `feat/dsh-peer-network-20261019`, build
 and install its tarball. The GitHub default branch may contain an older version:
 
 ```sh
 npm pack
-dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.6.tgz
+dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.7.tgz
 ```
 
 DSH's plugin manager owns dependency installation and bundle registration.
@@ -175,6 +175,18 @@ Upgrades from v5 migrate legacy SSH URLs to LAN discovery and copy any
 market-owned pairing key into plugin-owned credentials. The v6 runtime discards
 SSH tunnel settings. Verify the migrated credentials and a real peer connection
 before removing an older standalone connector.
+
+## History recovery (`2.0.16-dsh.7`)
+
+A history file that exceeds the bounded reader limits no longer stops the
+queue. The worker records the skipped file's size and modification time,
+continues with other files and shows a separate warning in both Settings UIs.
+Changed files are reconsidered; transient read failures retry after five minutes.
+The raw-file 64 MiB and expanded-input 128 MiB limits remain in place.
+Model, summary-format, import and embedding failures now have separate safe
+status messages. The original history and existing memories are preserved.
+Control-only Codex notifications are excluded even when followed by an assistant
+answer. Peer requests identify themselves as `MemOS-DSH/2` for machine gateways.
 
 ## Known limits
 

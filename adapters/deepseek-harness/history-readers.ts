@@ -27,6 +27,10 @@ export interface HistoryTurn {
 export const HISTORY_FILE_LIMIT = 64 * 1024 * 1024;
 export const HISTORY_DECOMPRESSED_LIMIT = 128 * 1024 * 1024;
 
+export class HistoryInputLimitError extends Error {
+  readonly code = "HISTORY_SOURCE_TOO_LARGE";
+}
+
 type JsonRecord = Record<string, unknown>;
 
 interface CodexTurnDraft {
@@ -80,8 +84,8 @@ export function parseCodexHistory(text: string, path: string): HistoryTurn[] {
 
       if (payload.role === "user") {
         const candidate = textFromCodexContent(payload.content, "input_text");
-        if (!isHumanCodexText(candidate)) return;
-        const request = extractWrappedHumanText(candidate) ?? candidate;
+        const request = extractWrappedHumanText(candidate);
+        if (!request || !isHumanCodexText(request)) return;
         pending = {
           sessionId,
           cwd,
@@ -135,8 +139,8 @@ export function parseCodexHistory(text: string, path: string): HistoryTurn[] {
       const payload = asRecord(record.payload);
       if (payload?.type === "user_message") {
         const candidate = eventMessageText(payload);
-        if (!isHumanCodexText(candidate)) return;
-        const request = extractWrappedHumanText(candidate) ?? candidate;
+        const request = extractWrappedHumanText(candidate);
+        if (!request || !isHumanCodexText(request)) return;
         // Legacy user_message events mirror response_item user messages in
         // newer rollouts. Do not create a second draft when the same prompt
         // is already pending.
@@ -294,7 +298,7 @@ export async function readHistoryFile(
     throw new Error(`History path ${path} is not a regular file.`);
   }
   if (info.size > HISTORY_FILE_LIMIT) {
-    throw new Error(
+    throw new HistoryInputLimitError(
       `History file ${path} is ${info.size} bytes; the 64 MiB input limit was exceeded.`,
     );
   }
@@ -337,7 +341,7 @@ async function readUtf8Bounded(path: string, limit: number): Promise<string> {
   for await (const chunk of createReadStream(path)) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buffer.length;
-    if (total > limit) throw new Error(`History input for ${path} exceeded its read limit.`);
+    if (total > limit) throw new HistoryInputLimitError(`History input for ${path} exceeded its read limit.`);
     chunks.push(buffer);
   }
   return Buffer.concat(chunks, total).toString("utf8");
@@ -365,7 +369,7 @@ async function decompressConcatenatedZstd(
   while (offset < compressed.length) {
     const remaining = HISTORY_DECOMPRESSED_LIMIT - total;
     if (remaining <= 0) {
-      throw new Error(
+      throw new HistoryInputLimitError(
         `Decompressed history for ${path} exceeded the 128 MiB limit.`,
       );
     }
@@ -379,7 +383,7 @@ async function decompressConcatenatedZstd(
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         total += buffer.length;
         if (total > HISTORY_DECOMPRESSED_LIMIT) {
-          callback(new Error(
+          callback(new HistoryInputLimitError(
             `Decompressed history for ${path} exceeded the 128 MiB limit.`,
           ));
           return;
@@ -424,7 +428,7 @@ async function readBounded(path: string, limit: number): Promise<Buffer> {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buffer.length;
     if (total > limit) {
-      throw new Error(`History input ${path} exceeded the 64 MiB limit.`);
+      throw new HistoryInputLimitError(`History input ${path} exceeded the 64 MiB limit.`);
     }
     chunks.push(buffer);
   }
@@ -486,6 +490,7 @@ function isHumanCodexText(text: string): boolean {
   if (/^<external_codex_apps_open_page>/i.test(value)) return false;
   if (/^<codex_internal_context\b/i.test(value)) return false;
   if (/^<compaction\b/i.test(value)) return false;
+  if (/^<(?:subagent_notification|in-app-browser-context|send_user_message_question_reply)\b/i.test(value)) return false;
   if (/^<(?:tool|tool_output|function_call_output)\b/i.test(value)) return false;
   return true;
 }

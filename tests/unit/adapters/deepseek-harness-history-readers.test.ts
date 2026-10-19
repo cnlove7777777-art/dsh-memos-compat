@@ -427,6 +427,26 @@ describe("Codex history reader", () => {
     expect(parseCodexHistory(text, "/synthetic/controls.jsonl")).toEqual([]);
   });
 
+  it.each([
+    "<subagent_notification>synthetic status</subagent_notification>",
+    "<subagent_notification>truncated synthetic status",
+    "<in-app-browser-context>synthetic page</in-app-browser-context>",
+    "<send_user_message_question_reply>synthetic reply</send_user_message_question_reply>",
+  ])("does not pair a control-only message with the next assistant answer: %s", (message) => {
+    for (const event of [false, true]) {
+      const text = [
+        codexLine({ type: "session_meta", payload: { id: "synthetic-session", source: "cli" } }),
+        codexLine(event
+          ? { type: "event_msg", payload: { type: "user_message", message } }
+          : { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: message }] } }),
+        codexLine(event
+          ? { type: "event_msg", payload: { type: "agent_message", message: "Synthetic answer" } }
+          : { type: "response_item", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "Synthetic answer" }] } }),
+      ].join("");
+      expect(parseCodexHistory(text, "/synthetic/controls-with-answer.jsonl")).toEqual([]);
+    }
+  });
+
   it("retains a real human request after a control wrapper", () => {
     const text = [
       codexLine({

@@ -298,7 +298,7 @@ export class DshRemoteMemory {
     const config = this.options.config(), target = peerUrl(base, route), body = value === undefined ? "" : JSON.stringify(value);
     if (Buffer.byteLength(body) > 1024 * 1024) throw new Error("Peer request too large");
     const key = await readPeerToken(config.tokenFile, this.reader);
-    const headers: Record<string, string> = { Accept: "application/json", "Content-Type": "application/json",
+    const headers: Record<string, string> = { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "MemOS-DSH/2",
       ...signPeerRequest(key, this.nodeId(), method, route, body) };
     if (target.protocol === "https:") {
       headers.Authorization = `Bearer ${key}`;

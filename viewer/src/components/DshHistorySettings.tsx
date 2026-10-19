@@ -52,6 +52,8 @@ export interface DshHistoryStatus {
   skipped: number;
   waitingForModel: boolean;
   lastError?: string;
+  skippedFiles?: number;
+  lastWarning?: string;
 }
 
 export interface DshHistoryMcp {
@@ -772,6 +774,7 @@ export function DshHistorySettings({
         </span>
         <span class="pill pill--info">已导入 {snapshot.status.imported}</span>
         <span class="pill pill--subtle">已跳过 {snapshot.status.skipped}</span>
+        {!!snapshot.status.skippedFiles && <span class="pill pill--candidate">已跳过文件 {snapshot.status.skippedFiles}</span>}
         <span class="pill pill--subtle">
           上次运行 {formatTimestamp(snapshot.status.lastRunAt)}
         </span>
@@ -788,6 +791,11 @@ export function DshHistorySettings({
         </div>
       )}
 
+      {snapshot.status.lastWarning && (
+        <div role="status" style="margin-top:var(--sp-2);font-size:var(--fs-xs);color:var(--warning)">
+          {snapshot.status.lastWarning}
+        </div>
+      )}
       {notice && (
         <div
           role="status"

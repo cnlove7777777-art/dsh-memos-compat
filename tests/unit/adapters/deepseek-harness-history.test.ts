@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +8,7 @@ import {
   DshHistoryWorker,
   type HistoryConfig,
 } from "../../../adapters/deepseek-harness/history.js";
-import type { HistoryTurn } from "../../../adapters/deepseek-harness/history-readers.js";
+import { HISTORY_FILE_LIMIT, readHistoryFile, type HistoryTurn } from "../../../adapters/deepseek-harness/history-readers.js";
 
 const homes: string[] = [];
 
@@ -204,6 +204,53 @@ async function worker(options: {
 }
 
 describe("DshHistoryWorker synthetic lifecycle", () => {
+  it("skips an oversized source without blocking valid files and retries it only after change", async () => {
+    const home = await tempHome(), cfg = config(home);
+    const bad = await historyFile(cfg.codexRoot, "rollout-oversized.jsonl");
+    await truncate(bad, HISTORY_FILE_LIMIT + 1);
+    const good = await historyFile(cfg.codexRoot, "rollout-valid.jsonl");
+    const reader = vi.fn(async (path: string, source: "codex" | "dsh") =>
+      path === bad ? readHistoryFile(path, source) : [turn(1)]);
+    const run = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [], reader });
+    await run.start(); await run.worker.waitForIdle();
+    expect(run.core.importBundle).toHaveBeenCalledOnce();
+    expect(await run.worker.snapshot()).toMatchObject({ status: { imported: 1, skippedFiles: 1,
+      lastWarning: expect.stringContaining("超过大小上限"), lastError: undefined } });
+    const saved = JSON.parse(await readFile(join(home, "dsh-history-cursors.json"), "utf8"));
+    expect(saved.files[bad].skippedReason).toBe("too-large");
+    expect(saved.files[good].skippedReason).toBeUndefined();
+
+    const retryReader = vi.fn(reader);
+    const retry = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [], reader: retryReader });
+    await retry.resume(); await retry.worker.waitForIdle();
+    expect(retryReader).not.toHaveBeenCalled();
+    expect(await retry.worker.snapshot()).toMatchObject({ status: { skippedFiles: 1 } });
+
+    await writeFile(bad, "{}\n");
+    await retry.worker.run(); await retry.worker.waitForIdle();
+    expect(retryReader).toHaveBeenCalledOnce();
+    expect(await retry.worker.snapshot()).toMatchObject({ status: { skippedFiles: 0, lastWarning: undefined } });
+  });
+
+  it("isolates a private source read failure and schedules a bounded retry", async () => {
+    const home = await tempHome(), cfg = config(home);
+    const bad = await historyFile(cfg.codexRoot, "rollout-unreadable.jsonl");
+    await historyFile(cfg.codexRoot, "rollout-valid.jsonl");
+    const reader = vi.fn(async (path: string) => {
+      if (path === bad) throw new Error("private-path and Bearer secret-must-not-appear");
+      return [turn(2)];
+    });
+    const run = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [], reader });
+    await run.start(); await run.worker.waitForIdle();
+    expect(run.core.importBundle).toHaveBeenCalledOnce();
+    const snapshot = await run.worker.snapshot();
+    expect(snapshot).toMatchObject({ status: { skippedFiles: 1, lastError: undefined } });
+    expect(JSON.stringify(snapshot)).not.toMatch(/private-path|secret-must-not-appear/);
+    const saved = JSON.parse(await readFile(join(home, "dsh-history-cursors.json"), "utf8"));
+    expect(saved.files[bad]).toMatchObject({ skippedReason: "unreadable", retryAfter: expect.any(Number) });
+    expect(saved.files[bad].retryAfter).toBeGreaterThan(Date.now());
+  });
+
   it("stores pairing and login secrets privately and never returns them in settings", async () => {
     const home = await tempHome(), cfg = config(home);
     const run = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [] });
@@ -406,7 +453,7 @@ describe("DshHistoryWorker synthetic lifecycle", () => {
     await failed.start();
     await failed.worker.waitForIdle();
     expect((await failed.worker.snapshot()) as { status: { lastError?: string } })
-      .toMatchObject({ status: { lastError: expect.stringMatching(/maintenance failed/i) } });
+      .toMatchObject({ status: { lastError: expect.stringContaining("记忆模型请求失败"), lastErrorCode: "HISTORY_REFINE_FAILED" } });
     const cursorPath = join(home, "dsh-history-cursors.json");
     const cursor = await readFile(cursorPath, "utf8").catch(() => "{\"files\":{}}");
     expect(JSON.parse(cursor).files).toEqual({});

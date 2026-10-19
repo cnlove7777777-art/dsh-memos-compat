@@ -85,6 +85,8 @@ interface HistoryStatus {
   skipped: number;
   waitingForModel: boolean;
   lastError?: string;
+  skippedFiles?: number;
+  lastWarning?: string;
 }
 
 interface HistoryMcp {
@@ -1384,6 +1386,7 @@ function HistorySettingsCard({
         </span>
         <span className="memos-settings-chip">已导入 {status.imported}</span>
         <span className="memos-settings-chip">已跳过 {status.skipped}</span>
+        {!!status.skippedFiles && <span className="memos-settings-chip" data-tone="warn">已跳过文件 {status.skippedFiles}</span>}
         <span className="memos-settings-chip">上次运行 {formatTimestamp(status.lastRunAt)}</span>
         {status.waitingForModel && (
           <span className="memos-settings-chip" data-tone="warn">等待记忆模型</span>
@@ -1392,6 +1395,7 @@ function HistorySettingsCard({
       {status.lastError !== undefined && status.lastError !== "" && (
         <p className="memos-settings-message" data-tone="warn">{status.lastError}</p>
       )}
+      {status.lastWarning && <p className="memos-settings-message" data-tone="warn">{status.lastWarning}</p>}
 
       {error !== "" && (
         <p className="memos-settings-message" data-tone="error" role="alert">{error}</p>
