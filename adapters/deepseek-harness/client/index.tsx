@@ -53,7 +53,20 @@ interface HistoryRemoteConfig {
   enabled: boolean;
   url: string;
   tokenFile: string;
+  /** Legacy response field; accepted for compatibility but never submitted. */
   tunnelFile?: string;
+  /** Write-only values stay in component state and are cleared after save. */
+  pairingKey?: string;
+  session?: string;
+  nodeId?: string;
+  expectedNodeId?: string;
+  lanDiscovery?: boolean;
+  peerPort?: number | string;
+  pollIntervalSeconds?: number | string;
+  syncEnabled?: boolean;
+  sessionFile?: string;
+  hasPairingKey?: boolean;
+  hasSession?: boolean;
 }
 
 interface HistoryConfig {
@@ -83,6 +96,17 @@ interface HistorySnapshot {
   config: HistoryConfig;
   status: HistoryStatus;
   mcp: HistoryMcp;
+  remote?: HistoryRemoteStatus;
+}
+
+interface HistoryRemoteStatus {
+  state: string;
+  route?: "lan" | "wan" | "offline" | (string & {});
+  url?: string;
+  nodeId?: string;
+  lastConnectedAt?: number;
+  lastError?: string;
+  sync?: unknown;
 }
 
 interface JsonErrorEnvelope {
@@ -113,7 +137,10 @@ const TEST_PATH = "/api/memos/test";
 const EMBEDDING_TEST_PATH = "/api/memos/embedding-test";
 const HISTORY_PATH = "/api/memos/history";
 const HISTORY_RUN_PATH = "/api/memos/history-run";
+export const HISTORY_CONNECT_PATH = "/api/memos/history/connect";
 const MEMORY_ROUTE_VALUE = "__memory_route__";
+const DEFAULT_PEER_PORT = 18_802;
+const DEFAULT_POLL_INTERVAL_SECONDS = 30;
 
 const CSS = `
 .memos-settings-root {
@@ -325,6 +352,11 @@ const CSS = `
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
+.memos-settings-peer-toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
 .memos-settings-readonly {
   display: flex;
   flex-direction: column;
@@ -346,6 +378,15 @@ const CSS = `
   background: var(--dsw-alias-bg-module-platform);
   font-size: 12px;
   line-height: 18px;
+}
+.memos-settings-details {
+  border-top: .5px solid var(--dsw-alias-border-l2);
+}
+.memos-settings-details > summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 20px;
 }
 .memos-settings-current {
   display: flex;
@@ -449,6 +490,9 @@ const CSS = `
   .memos-settings-mode-grid,
   .memos-settings-embedding-grid,
   .memos-settings-field-grid {
+    grid-template-columns: 1fr;
+  }
+  .memos-settings-peer-toggle-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -569,8 +613,106 @@ function formatTimestamp(value: number | undefined): string {
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }
 
+function formatConnectedAt(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return "尚未连接";
+  return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+
+function remoteStateLabel(state: string | undefined): string {
+  switch (state?.toLowerCase()) {
+    case "connected":
+    case "online":
+    case "ready":
+      return "已连接";
+    case "connecting":
+    case "discovering":
+    case "polling":
+      return "正在连接";
+    case "offline":
+    case "disconnected":
+      return "未连接";
+    case "error":
+    case "failed":
+      return "连接失败";
+    case "disabled":
+      return "未启用";
+    default:
+      return state?.trim() || "尚未测试";
+  }
+}
+
+function remoteStateTone(state: string | undefined): "good" | "warn" | "bad" {
+  switch (state?.toLowerCase()) {
+    case "connected":
+    case "online":
+    case "ready":
+      return "good";
+    case "error":
+    case "failed":
+      return "bad";
+    default:
+      return "warn";
+  }
+}
+
+function remoteStateFailed(state: string | undefined): boolean {
+  return ["error", "failed", "offline", "disconnected"].includes(state?.toLowerCase() ?? "");
+}
+
+function remoteRouteLabel(route: string | undefined): string {
+  switch (route?.toLowerCase()) {
+    case "lan":
+      return "局域网直连";
+    case "wan":
+      return "公网 HTTPS";
+    case "offline":
+      return "离线";
+    default:
+      return route?.trim() || "";
+  }
+}
+
+function syncCount(sync: unknown): number | undefined {
+  if (!isRecord(sync)) return undefined;
+  const direct = finitePositive(sync.synced ?? sync.count ?? sync.items);
+  if (direct !== undefined) return direct;
+  if (!isRecord(sync.replicas)) return undefined;
+  let total = 0;
+  for (const value of Object.values(sync.replicas)) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) total += value;
+  }
+  return total;
+}
+
+function remoteConnectionMessage(remote: HistoryRemoteStatus | undefined): string {
+  if (remote === undefined) return "连接测试完成，但服务端没有返回远端状态。";
+  const route = remoteRouteLabel(remote.route);
+  const nodeId = remote.nodeId?.trim();
+  return ["连接测试", remoteStateLabel(remote.state), route, nodeId ? `对端 ${nodeId}` : ""]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 function clampRecentDays(value: number): number {
   return Math.min(30, Math.max(1, Math.round(value)));
+}
+
+function clampNumber(value: number, fallback: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function historyPeerPort(value: unknown): number {
+  return clampNumber(Number(value), DEFAULT_PEER_PORT, 1_024, 65_535);
+}
+
+function historyPollInterval(value: unknown): number {
+  return clampNumber(
+    Number(value),
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    15,
+    3_600,
+  );
 }
 
 function historyModelKey(model: HistoryBackgroundModel | undefined): string {
@@ -597,7 +739,88 @@ function historyConfigDraft(snapshot: HistorySnapshot): HistoryConfig {
     ...(snapshot.config.backgroundModel === undefined
       ? {}
       : { backgroundModel: snapshot.config.backgroundModel }),
-    remote: { ...snapshot.config.remote },
+    remote: historyRemoteDraft(snapshot.config.remote),
+  };
+}
+
+function historyRemoteDraft(remote: HistoryRemoteConfig): HistoryRemoteConfig {
+  return {
+    enabled: remote.enabled,
+    url: remote.url,
+    tokenFile: remote.tokenFile,
+    ...(remote.sessionFile === undefined ? {} : { sessionFile: remote.sessionFile }),
+    ...(remote.nodeId === undefined ? {} : { nodeId: remote.nodeId }),
+    ...(remote.expectedNodeId === undefined ? {} : { expectedNodeId: remote.expectedNodeId }),
+    lanDiscovery: remote.lanDiscovery !== false,
+    peerPort: historyPeerPort(remote.peerPort),
+    pollIntervalSeconds: historyPollInterval(remote.pollIntervalSeconds),
+    ...(remote.syncEnabled === undefined ? {} : { syncEnabled: remote.syncEnabled }),
+    ...(remote.hasPairingKey === true ? { hasPairingKey: true } : {}),
+    ...(remote.hasSession === true ? { hasSession: true } : {}),
+  };
+}
+
+function historyDraftAfterResponse(
+  previous: HistoryConfig | undefined,
+  configAtStart: HistoryConfig,
+  next: HistorySnapshot,
+): HistoryConfig {
+  if (previous !== undefined && !sameHistoryConfig(previous, configAtStart)) {
+    return previous;
+  }
+  return historyConfigDraft(next);
+}
+
+export function historyDraftAfterStatusRefresh(
+  previous: HistoryConfig | undefined,
+  configAtStart: HistoryConfig | undefined,
+  next: HistorySnapshot,
+): HistoryConfig {
+  if (
+    previous !== undefined
+    && configAtStart !== undefined
+    && !sameHistoryConfig(previous, configAtStart)
+  ) {
+    return previous;
+  }
+  return historyConfigDraft(next);
+}
+
+export function buildHistorySavePayload(config: HistoryConfig): HistoryConfig {
+  return {
+    enabled: config.enabled,
+    codexRoot: config.codexRoot,
+    dshRoot: config.dshRoot,
+    recentDays: config.recentDays,
+    ...(config.backgroundModel === undefined
+      ? {}
+      : { backgroundModel: config.backgroundModel }),
+    remote: {
+      enabled: config.remote.enabled,
+      url: config.remote.url,
+      tokenFile: config.remote.tokenFile,
+      ...(config.remote.sessionFile?.trim()
+        ? { sessionFile: config.remote.sessionFile.trim() }
+        : {}),
+      ...(config.remote.nodeId?.trim()
+        ? { nodeId: config.remote.nodeId.trim() }
+        : {}),
+      ...(config.remote.expectedNodeId?.trim()
+        ? { expectedNodeId: config.remote.expectedNodeId.trim() }
+        : {}),
+      lanDiscovery: config.remote.lanDiscovery !== false,
+      peerPort: historyPeerPort(config.remote.peerPort),
+      pollIntervalSeconds: historyPollInterval(config.remote.pollIntervalSeconds),
+      ...(config.remote.syncEnabled === undefined
+        ? {}
+        : { syncEnabled: config.remote.syncEnabled }),
+      ...(config.remote.pairingKey?.trim()
+        ? { pairingKey: config.remote.pairingKey }
+        : {}),
+      ...(config.remote.session?.trim()
+        ? { session: config.remote.session }
+        : {}),
+    },
   };
 }
 
@@ -610,7 +833,16 @@ function sameHistoryConfig(left: HistoryConfig, right: HistoryConfig): boolean {
     && left.remote.enabled === right.remote.enabled
     && left.remote.url === right.remote.url
     && left.remote.tokenFile === right.remote.tokenFile
-    && (left.remote.tunnelFile ?? "") === (right.remote.tunnelFile ?? "");
+    && (left.remote.sessionFile ?? "") === (right.remote.sessionFile ?? "")
+    && (left.remote.nodeId ?? "") === (right.remote.nodeId ?? "")
+    && (left.remote.expectedNodeId ?? "") === (right.remote.expectedNodeId ?? "")
+    && (left.remote.lanDiscovery !== false) === (right.remote.lanDiscovery !== false)
+    && historyPeerPort(left.remote.peerPort) === historyPeerPort(right.remote.peerPort)
+    && historyPollInterval(left.remote.pollIntervalSeconds)
+      === historyPollInterval(right.remote.pollIntervalSeconds)
+    && left.remote.syncEnabled === right.remote.syncEnabled
+    && (left.remote.pairingKey ?? "") === (right.remote.pairingKey ?? "")
+    && (left.remote.session ?? "") === (right.remote.session ?? "");
 }
 
 function historyModelGroups(models: ModelOption[]) {
@@ -639,7 +871,13 @@ function historyField(
   value: string,
   disabled: boolean,
   onInput: (value: string) => void,
-  options: { type?: string; min?: number; max?: number; placeholder?: string } = {},
+  options: {
+    type?: string;
+    min?: number;
+    max?: number;
+    placeholder?: string;
+    autoComplete?: string;
+  } = {},
 ) {
   return (
     <label className="memos-settings-field">
@@ -652,6 +890,7 @@ function historyField(
         value={value}
         disabled={disabled}
         spellCheck={false}
+        autoComplete={options.autoComplete}
         placeholder={options.placeholder}
         onInput={(event) => onInput(event.currentTarget.value)}
       />
@@ -691,7 +930,7 @@ function HistorySettingsCard({
   const [draft, setDraft] = useState<HistoryConfig>();
   const [capability, setCapability] = useState<"loading" | "ready" | "missing" | "error">("loading");
   const [capabilityError, setCapabilityError] = useState("");
-  const [action, setAction] = useState<"" | "save" | "run" | "status">("");
+  const [action, setAction] = useState<"" | "save" | "run" | "status" | "connect">("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -716,6 +955,11 @@ function HistorySettingsCard({
   const busy = action !== "";
   const dirty = history !== undefined && draft !== undefined
     && !sameHistoryConfig(draft, history.config);
+  const remoteStatus = history?.remote;
+  const pairingConfigured = history?.config.remote.hasPairingKey === true
+    || draft?.remote.hasPairingKey === true;
+  const sessionConfigured = history?.config.remote.hasSession === true
+    || draft?.remote.hasSession === true;
 
   const applyHistorySnapshot = (next: HistorySnapshot) => {
     setHistory(next);
@@ -776,7 +1020,7 @@ function HistorySettingsCard({
     try {
       const next = await requestJson<HistorySnapshot>(HISTORY_PATH, {
         method: "PUT",
-        body: JSON.stringify(draft),
+        body: JSON.stringify(buildHistorySavePayload(draft)),
       });
       applyHistorySnapshot(next);
       setCapability("ready");
@@ -813,23 +1057,64 @@ function HistorySettingsCard({
 
   const refreshStatus = async () => {
     if (busy) return;
+    const configAtStart = history?.config;
     setAction("status");
     setMessage("");
     setError("");
     try {
       const next = await requestJson<HistorySnapshot>(HISTORY_PATH);
       setHistory(next);
-      setDraft((previous) => previous === undefined
-        ? historyConfigDraft(next)
-        : dirty
-          ? previous
-          : historyConfigDraft(next));
+      setDraft((previous) =>
+        historyDraftAfterStatusRefresh(previous, configAtStart, next));
       setCapability("ready");
       setMessage("运行状态已刷新。");
     } catch (cause) {
       const failure = historyFailureOf(cause);
       setError(`刷新状态失败：${failure.message}`);
       if (failure.status === 404) setCapability("missing");
+    } finally {
+      setAction("");
+    }
+  };
+
+  const connect = async () => {
+    if (busy) return;
+    if (dirty) {
+      setMessage("");
+      setError("有未保存的改动，请先保存后再测试已保存配置。");
+      return;
+    }
+    if (history?.config.remote.enabled !== true) {
+      setMessage("");
+      setError("请先启用并保存远端连接配置。");
+      return;
+    }
+    const configAtStart = history.config;
+    setAction("connect");
+    setMessage("");
+    setError("");
+    try {
+      const next = await requestJson<HistorySnapshot>(HISTORY_CONNECT_PATH, {
+        method: "POST",
+        body: "{}",
+      });
+      setHistory(next);
+      // The action submits only an empty JSON object, never the unsaved form.
+      setDraft((previous) =>
+        historyDraftAfterResponse(previous, configAtStart, next));
+      setCapability("ready");
+      if (next.remote !== undefined && remoteStateFailed(next.remote.state)) {
+        setError(remoteConnectionMessage(next.remote));
+      } else {
+        setMessage(remoteConnectionMessage(next.remote));
+      }
+    } catch (cause) {
+      const failure = historyFailureOf(cause);
+      if (failure.status === 404) {
+        setError("当前服务端未提供“发现并测试连接”接口。");
+      } else {
+        setError(`连接测试失败：${failure.message}`);
+      }
     } finally {
       setAction("");
     }
@@ -869,6 +1154,7 @@ function HistorySettingsCard({
           {status.waitingForModel && <span className="memos-settings-chip" data-tone="warn">等待模型</span>}
         </div>
       </div>
+      <p className="memos-settings-muted">凭据只写不回显。</p>
 
       {historyCheckbox(
         draft.enabled,
@@ -938,38 +1224,150 @@ function HistorySettingsCard({
 
       {historyCheckbox(
         draft.remote.enabled,
-        "启用指定远端记忆库",
-        "只连接显式 URL；不扫描网络，不复制原始 Codex 会话。",
+        "启用 MemOS 联网与设备互联",
+        "通过 HTTPS 或已配对的局域网发现连接另一台设备；只同步记忆摘要，不上传原始会话。",
         busy,
         (enabled) => patchRemote({ enabled }),
       )}
 
+      {(remoteStatus !== undefined || draft.remote.enabled) && (
+        <div className="memos-settings-readonly">
+          <div className="memos-settings-chip-row">
+            <span
+              className="memos-settings-chip"
+              data-tone={remoteStateTone(remoteStatus?.state)}
+            >
+              {remoteStateLabel(remoteStatus?.state)}
+            </span>
+            {remoteRouteLabel(remoteStatus?.route) !== "" && (
+              <span className="memos-settings-chip">{remoteRouteLabel(remoteStatus?.route)}</span>
+            )}
+            {syncCount(remoteStatus?.sync) !== undefined && (
+              <span className="memos-settings-chip">
+                已同步 {syncCount(remoteStatus?.sync)} 条
+              </span>
+            )}
+          </div>
+          {(remoteStatus?.nodeId !== undefined || remoteStatus?.url !== undefined) && (
+            <span className="memos-settings-route">
+              {[remoteStatus.nodeId, remoteStatus.url].filter(Boolean).join(" · ")}
+            </span>
+          )}
+          <span className="memos-settings-muted">
+            上次连接 {formatConnectedAt(remoteStatus?.lastConnectedAt)}
+          </span>
+          {remoteStatus?.lastError !== undefined && remoteStatus.lastError !== "" && (
+            <span className="memos-settings-message" data-tone="error" role="status">
+              {remoteStatus.lastError}
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="memos-settings-field-grid">
         {historyField(
-          "远端 API 地址",
+          "远程 HTTPS 地址（可选）",
           draft.remote.url,
           busy,
           (url) => patchRemote({ url }),
-          { type: "url", placeholder: "https://memory.example.com" },
+          { type: "url", placeholder: "https://memory.example.com/desktop/api/memory-peer" },
         )}
         {historyField(
-          "Token 文件（JSON）",
-          draft.remote.tokenFile,
+          "配对 key（写入后不回显）",
+          draft.remote.pairingKey ?? "",
           busy,
-          (tokenFile) => patchRemote({ tokenFile }),
-          { placeholder: "C:\\secrets\\memos-token.json" },
+          (pairingKey) => patchRemote({ pairingKey }),
+          {
+            type: "password",
+            autoComplete: "new-password",
+            placeholder: pairingConfigured ? "已配置；留空保持原值" : "输入配对 key",
+          },
         )}
         {historyField(
-          "SSH 设置 JSON（可选）",
-          draft.remote.tunnelFile ?? "",
+          "服务器 session（写入后不回显）",
+          draft.remote.session ?? "",
           busy,
-          (tunnelFile) => patchRemote({ tunnelFile }),
-          { placeholder: "C:\\secrets\\ssh-settings.json" },
+          (session) => patchRemote({ session }),
+          {
+            type: "password",
+            autoComplete: "new-password",
+            placeholder: sessionConfigured ? "已配置；留空保持原值" : "可选：服务器分配 session",
+          },
+        )}
+        {historyField(
+          "本机设备标识",
+          draft.remote.nodeId ?? "",
+          busy,
+          (nodeId) => patchRemote({ nodeId }),
+          { placeholder: "例如 nanopi-m4v2" },
+        )}
+        {historyField(
+          "期望对端 ID",
+          draft.remote.expectedNodeId ?? "",
+          busy,
+          (expectedNodeId) => patchRemote({ expectedNodeId }),
+          { placeholder: "防止连错设备，可留空" },
+        )}
+        {historyField(
+          "服务端口",
+          String(draft.remote.peerPort ?? DEFAULT_PEER_PORT),
+          busy,
+          (peerPort) => patchRemote({ peerPort }),
+          { type: "number", min: 1_024, max: 65_535 },
+        )}
+        {historyField(
+          "发现间隔（秒）",
+          String(
+            draft.remote.pollIntervalSeconds
+            ?? DEFAULT_POLL_INTERVAL_SECONDS,
+          ),
+          busy,
+          (pollIntervalSeconds) => patchRemote({ pollIntervalSeconds }),
+          { type: "number", min: 15, max: 3_600 },
         )}
       </div>
+
+      <div className="memos-settings-peer-toggle-grid">
+        {historyCheckbox(
+          draft.remote.lanDiscovery !== false,
+          "LAN 自动发现",
+          "只接受已完成身份绑定和认证的局域网对端。",
+          busy,
+          (lanDiscovery) => patchRemote({ lanDiscovery }),
+        )}
+        {historyCheckbox(
+          draft.remote.syncEnabled === true,
+          "自动同步记忆",
+          "仅同步摘要、结构、来源标识与向量，不复制原始会话。",
+          busy,
+          (syncEnabled) => patchRemote({ syncEnabled }),
+        )}
+      </div>
+
       <p className="memos-settings-note">
-        这里只填写已有 JSON 文件的路径，不显示或保存 token 内容；不会扫描目录。
+        配对 key 与 session 只写入私有 sidecar，保存成功后清空输入且不会回显。
+        此页不会启动 SSH；保存时会丢弃旧 tunnelFile 字段。
       </p>
+
+      <details className="memos-settings-details">
+        <summary>高级兼容</summary>
+        <div className="memos-settings-field-grid">
+          {historyField(
+            "旧版 Token 文件（JSON，可选）",
+            draft.remote.tokenFile,
+            busy,
+            (tokenFile) => patchRemote({ tokenFile }),
+            { placeholder: "C:\\secrets\\memos-token.json" },
+          )}
+          {historyField(
+            "服务器 session 文件（可选）",
+            draft.remote.sessionFile ?? "",
+            busy,
+            (sessionFile) => patchRemote({ sessionFile }),
+            { placeholder: "C:\\secrets\\memory-session.json" },
+          )}
+        </div>
+      </details>
 
       <div className="memos-settings-readonly">
         <span className="memos-settings-label">MCP 只读状态</span>
@@ -1012,6 +1410,22 @@ function HistorySettingsCard({
           onClick={() => void refreshStatus()}
         >
           {action === "status" ? "刷新中…" : "刷新状态"}
+        </button>
+        {dirty && (
+          <span className="memos-settings-message" data-tone="warn">
+            有未保存改动；测试前请先保存
+          </span>
+        )}
+        <button
+          type="button"
+          className="memos-settings-button"
+          disabled={busy}
+          title={dirty
+            ? "请先保存未提交的改动，再测试已保存配置"
+            : "使用已保存的配置发现并测试连接"}
+          onClick={() => void connect()}
+        >
+          {action === "connect" ? "测试中…" : "发现并测试连接"}
         </button>
         <button
           type="button"
