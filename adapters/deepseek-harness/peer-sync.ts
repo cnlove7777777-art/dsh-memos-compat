@@ -14,6 +14,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 import type { RetrievalHitDTO, TraceDTO } from "../../agent-contract/dto.js";
+import { parseYaml } from "../../core/config/yaml.js";
+import { normalizeNamespace } from "../../core/runtime/namespace.js";
 import { openDb, type StorageDb } from "../../core/storage/index.js";
 
 export const PEER_SYNC_PROTOCOL = "saya-memory-sync/1" as const;
@@ -33,6 +35,8 @@ export interface PeerSyncVector {
 export interface PeerSyncItem {
   kind: PeerSyncKind;
   id: string;
+  /** Opaque remote trace id. Never a native session/episode id. */
+  traceRef?: string;
   revision: string;
   payload: Record<string, unknown>;
   vectors: PeerSyncVector[];
@@ -41,6 +45,8 @@ export interface PeerSyncItem {
 export interface PeerSyncPage {
   protocol: typeof PEER_SYNC_PROTOCOL;
   nodeId: string;
+  /** Source profile that owns every payload in this page. */
+  profileId: string;
   items: PeerSyncItem[];
   nextCursor?: string;
   done: boolean;
@@ -55,6 +61,14 @@ export interface PeerSyncStoreOptions {
   home: string;
   dbPath: string;
   nodeId: string;
+  /** Receiving/runtime namespace. Source peers may use a different name. */
+  profileId?: string;
+  /**
+   * Full embedding identity as `<provider>/<model>`. Pass the live
+   * `core.health().embedder` value when available. When omitted, the
+   * profile's own `config.yaml` is read. Unknown identities disable vectors.
+   */
+  embeddingModel?: string;
 }
 
 export interface PeerSearchVector {
@@ -65,6 +79,7 @@ export interface PeerSearchVector {
 export interface PeerRetrievalHit extends RetrievalHitDTO {
   origin: "local" | "replica";
   originNode: string;
+  sourceProfileId?: string;
   remoteId: string;
   replica?: boolean;
   vectorScore?: number;
@@ -72,12 +87,18 @@ export interface PeerRetrievalHit extends RetrievalHitDTO {
 
 export interface PeerTraceDetail extends TraceDTO {
   originNode: string;
+  sourceProfileId?: string;
   remoteId: string;
+  /** Client-visible opaque id; remoteId remains the native replica row id. */
+  refId?: string;
   revision: string;
 }
 
 export interface PeerSyncStats {
   nodeId: string;
+  profileId: string;
+  sourceProfiles: string[];
+  embeddingModel?: string;
   sourceDb: string;
   replicaDb: string;
   source: Record<PeerSyncKind, number>;
@@ -87,23 +108,17 @@ export interface PeerSyncStats {
 }
 
 interface CursorState {
-  updatedAt: number;
-  kind: PeerSyncKind;
-  id: string;
-  sweep?: boolean;
-}
-
-interface CandidateRow {
-  kind: PeerSyncKind;
-  id: string;
-  revision: string;
-  updated_at: number;
-  payload_json: string;
-  vectors_json: string;
+  version: 2;
+  kind?: PeerSyncKind;
+  id?: string;
+  /** Starts a fresh full-table sweep on positive integers. */
+  rev?: number;
 }
 
 interface ReplicaRow {
+  profile_id: string;
   origin_node: string;
+  source_profile_id: string;
   kind: PeerSyncKind;
   id: string;
   revision: string;
@@ -230,19 +245,17 @@ const TABLE_SPECS: readonly TableSpec[] = [
   },
 ];
 
-const KIND_ORDER: Record<PeerSyncKind, number> = {
-  trace: 0,
-  policy: 1,
-  world_model: 2,
-  skill: 3,
-};
-
 const CREDENTIAL_KEY =
   /(?:^|_)(?:api_?key|access_?key|secret|password|passwd|token|authorization|cookie|private_?key|credential)(?:$|_)/i;
 const CREDENTIAL_VALUE =
   /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~+\/-]{12,}|\bsk-[A-Za-z0-9_-]{16,}|((?:api[_-]?key|access[_-]?token|password|bindkey)\s*[=:]\s*["']?)[^\s"',;]{8,}/i;
 const ABSOLUTE_PATH =
   /(?<![\w:/])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|\/(?:home|root|srv|Users|tmp|var|etc|opt|mnt|Volumes|private)\/)[^\s"'`<>]*/g;
+const SENSITIVE_KEY =
+  /(?:^|_)(?:user_?text|agent_?text|session_?(?:id|key)|messages?|tool_?calls?|raw_?session|transcript)(?:$|_)/i;
+const GLOBAL_ID = /^(?:session|episode):.+$/i;
+const WINDOWS_ID_PATH = /^[A-Za-z]:[\\/]/;
+const POSIX_HOME_PATH = /^(?:~[\\/]|\/(?:home|Users)\/)/;
 const SEARCH_SCAN_LIMIT = 2_000;
 
 export class PeerSyncStore {
@@ -250,11 +263,21 @@ export class PeerSyncStore {
   private replica?: StorageDb;
   private sourceTables = new Set<string>();
   private readonly replicaPath: string;
+  private readonly profileId: string;
+  private embeddingModel?: string;
 
   constructor(private readonly options: PeerSyncStoreOptions) {
     if (!options.home.trim()) throw new TypeError("PeerSyncStore home is required");
     if (!options.dbPath.trim()) throw new TypeError("PeerSyncStore dbPath is required");
     if (!validNodeId(options.nodeId)) throw new TypeError("PeerSyncStore nodeId is invalid");
+    this.profileId = normalizeProfileId(normalizeNamespace({
+      agentKind: "deepseek-harness",
+      profileId: options.profileId,
+    }).profileId);
+    this.embeddingModel = normalizeEmbeddingModel(options.embeddingModel);
+    if (options.embeddingModel !== undefined && !this.embeddingModel) {
+      throw new TypeError("PeerSyncStore embeddingModel must be provider/model");
+    }
     this.replicaPath = path.join(path.resolve(options.home), "peer-replicas.db");
   }
 
@@ -262,6 +285,12 @@ export class PeerSyncStore {
     if (this.source) return;
     if (!fs.existsSync(this.options.dbPath)) {
       throw new Error("PeerSync source database does not exist");
+    }
+    if (!this.embeddingModel) {
+      this.embeddingModel = readConfiguredEmbeddingModel(
+        this.options.home,
+        path.dirname(path.resolve(this.options.dbPath)),
+      );
     }
     const source = openDb({ filepath: this.options.dbPath, agent: "deepseek-harness", readonly: true });
     let replica: StorageDb | undefined;
@@ -301,137 +330,63 @@ export class PeerSyncStore {
     const source = this.requireSource();
     const requested = clampLimit(options.limit);
     const cursor = parseCursor(options.cursor);
-    const candidates: CandidateRow[] = [];
-
-    for (const spec of TABLE_SPECS) {
-      if (!this.sourceTables.has(spec.table)) continue;
-      const available = new Set(
-        source
-          .prepare(`PRAGMA table_info(${quoteIdentifier(spec.table)})`)
-          .all()
-          .map((row) => String((row as { name: unknown }).name)),
-      );
-      const cols = spec.columns.filter((column) => available.has(column));
-      const updatedExpression = updatedExpressionFor(spec, available);
-      if (!updatedExpression || !available.has(spec.idColumn)) continue;
-      const payload = projectionColumns(cols, spec.kind);
-      const vectors = vectorColumns(spec.kind).filter((column) => available.has(column));
-      const cursorPredicate = cursor
-        ? `AND (${updatedExpression} > @updated_at
-             OR (${updatedExpression} = @updated_at AND ${quoteIdentifier(spec.idColumn)} > @id)
-             OR (${updatedExpression} = @updated_at AND ${quoteIdentifier(spec.idColumn)} = @id
-                 AND @kind > @kind_cursor))`
-        : "";
-      const params: Record<string, unknown> = {
-        kind: KIND_ORDER[spec.kind],
-        scan_limit: cursor
-          ? requested + 1
-          : Math.min(PEER_SYNC_MAX_PAGE_ITEMS * 4, requested + 1),
-      };
-      if (cursor) {
-        params.updated_at = cursor.updatedAt;
-        params.id = cursor.id;
-        params.kind_cursor = KIND_ORDER[cursor.kind];
-      }
-      const select = [
-        `${updatedExpression} AS peer_updated_at`,
-        quoteIdentifier(spec.idColumn),
-        ...payload.map(quoteIdentifier),
-        ...vectors.map(quoteIdentifier),
-      ].join(", ");
-      const sql = `
-        SELECT ${select}
-          FROM ${quoteIdentifier(spec.table)}
-         WHERE 1 = 1 ${cursorPredicate}
-         ORDER BY peer_updated_at ASC, ${quoteIdentifier(spec.idColumn)} ASC
-         LIMIT @scan_limit`;
-      const rows = source.prepare(sql).all(params) as Array<Record<string, unknown>>;
-      for (const row of rows) {
-        const id = safeString(row[spec.idColumn], 512);
-        const updatedAt = safeInteger(row.peer_updated_at);
-        if (!id || updatedAt === undefined) continue;
-        const itemPayload = buildPayload(spec.kind, row);
-        const itemVectors = buildVectors(spec.kind, row);
-        const revision = revisionOf(updatedAt, itemPayload, itemVectors);
-        candidates.push({
-          kind: spec.kind,
-          id,
-          revision,
-          updated_at: updatedAt,
-          payload_json: JSON.stringify(itemPayload),
-          vectors_json: JSON.stringify(itemVectors),
-        });
-      }
-    }
-
-    candidates.sort(compareCandidates);
-    if (candidates.length === 0 && cursor?.sweep) {
-      this.collectRevisionCandidates(source, candidates, requested);
-    }
-    const selected: PeerSyncItem[] = [];
+    const pageLimit = PEER_SYNC_MAX_PAGE_BYTES - 512;
+    const keys = this.sourceKeys(source, cursor, requested + 1);
+    const more = keys.length > requested;
+    const selectedKeys = keys.slice(0, requested);
+    const items: PeerSyncItem[] = [];
     let bytes = 0;
-    for (const candidate of candidates.slice(0, requested)) {
-      const item: PeerSyncItem = {
-        kind: candidate.kind,
-        id: candidate.id,
-        revision: candidate.revision,
-        payload: JSON.parse(candidate.payload_json) as Record<string, unknown>,
-        vectors: JSON.parse(candidate.vectors_json) as PeerSyncVector[],
-      };
-      const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
-      if (bytes + itemBytes > PEER_SYNC_MAX_PAGE_BYTES) {
-        if (selected.length === 0) {
-          throw new Error("PeerSync item exceeds the page byte limit");
-        }
+    for (const key of selectedKeys) {
+      const item = this.exportItem(source, key);
+      const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + (items.length > 0 ? 1 : 0);
+      if (bytes + itemBytes > pageLimit) {
+        if (items.length === 0) throw new Error("PeerSync item exceeds the page byte limit");
         break;
       }
       bytes += itemBytes;
-      selected.push(item);
+      items.push(item);
     }
-
-    const selectedLast = selected.length > 0
-      ? candidates.find((candidate) =>
-          candidate.kind === selected[selected.length - 1]!.kind &&
-          candidate.id === selected[selected.length - 1]!.id)
-      : undefined;
-    const cursorKey = selectedLast
-      ? { updated_at: selectedLast.updated_at, kind: selectedLast.kind, id: selectedLast.id }
-      : cursor
-        ? { updated_at: cursor.updatedAt, kind: cursor.kind, id: cursor.id }
+    const last = items.length > 0
+      ? selectedKeys[items.length - 1]
+      : cursor?.kind && cursor.id
+        ? { kind: cursor.kind, id: cursor.id }
         : undefined;
-    const hasMore = cursorKey
-      ? this.hasExportCandidatesAfter(source, cursorKey)
-      : false;
+    const hasMore = items.length < selectedKeys.length || more;
     const page: PeerSyncPage = {
       protocol: PEER_SYNC_PROTOCOL,
       nodeId: this.options.nodeId,
-      items: selected,
+      profileId: this.profileId,
+      items,
       done: !hasMore,
     };
-    if (cursorKey) page.nextCursor = encodeCursor({
-      updatedAt: cursorKey.updated_at,
-      kind: cursorKey.kind,
-      id: cursorKey.id,
-      sweep: !hasMore,
-    });
+    if (!hasMore && keys.length > 0) {
+      const rev = (cursor?.rev ?? 0) + 1;
+      page.nextCursor = encodeCursor({ version: 2, rev });
+    } else if (last) {
+      page.nextCursor = encodeCursor({ version: 2, kind: last.kind, id: last.id, rev: cursor?.rev });
+    }
     if (Buffer.byteLength(JSON.stringify(page), "utf8") > PEER_SYNC_MAX_PAGE_BYTES) {
       throw new Error("PeerSync page exceeds the response byte limit");
     }
     return page;
   }
 
-  importPage(page: unknown, expectedNodeId: string): { inserted: number; updated: number; skipped: number } {
+  importPage(
+    page: unknown,
+    expectedNodeId: string,
+    expectedSourceProfileId?: string,
+  ): { inserted: number; updated: number; skipped: number } {
     const replica = this.requireReplica();
-    const validated = validatePage(page, expectedNodeId, this.options.nodeId);
+    const validated = validatePage(page, expectedNodeId, this.options.nodeId, expectedSourceProfileId);
     const upsert = replica.prepare(`
       INSERT INTO peer_items (
-        origin_node, kind, id, revision, payload_json, vectors_json,
+        profile_id, origin_node, source_profile_id, kind, id, revision, payload_json, vectors_json,
         source_updated_at, imported_at
       ) VALUES (
-        @origin_node, @kind, @id, @revision, @payload_json, @vectors_json,
+        @profile_id, @origin_node, @source_profile_id, @kind, @id, @revision, @payload_json, @vectors_json,
         @source_updated_at, @imported_at
       )
-      ON CONFLICT(origin_node, kind, id) DO UPDATE SET
+      ON CONFLICT(profile_id, origin_node, source_profile_id, kind, id) DO UPDATE SET
         revision = excluded.revision,
         payload_json = excluded.payload_json,
         vectors_json = excluded.vectors_json,
@@ -441,18 +396,26 @@ export class PeerSyncStore {
          OR excluded.payload_json <> peer_items.payload_json
          OR excluded.vectors_json <> peer_items.vectors_json`);
     const exists = replica.prepare(
-      "SELECT revision FROM peer_items WHERE origin_node = ? AND kind = ? AND id = ?",
+      "SELECT revision FROM peer_items WHERE profile_id = ? AND origin_node = ? AND source_profile_id = ? AND kind = ? AND id = ?",
     );
     const result = { inserted: 0, updated: 0, skipped: 0 };
     replica.tx(() => {
       for (const item of validated.items) {
-        const previous = exists.get([validated.originNode, item.kind, item.id]) as
+        const previous = exists.get([
+          this.profileId,
+          validated.originNode,
+          validated.sourceProfileId,
+          item.kind,
+          item.id,
+        ]) as
           | { revision: string }
           | undefined;
         const payload = JSON.stringify(sanitizeForWire(item.payload));
         const vectors = JSON.stringify(sanitizeVectors(item.vectors));
         const run = upsert.run({
+          profile_id: this.profileId,
           origin_node: validated.originNode,
+          source_profile_id: validated.sourceProfileId,
           kind: item.kind,
           id: item.id,
           revision: item.revision,
@@ -473,6 +436,12 @@ export class PeerSyncStore {
     this.requireReplica();
     const text = query.trim().slice(0, 2_000);
     if (!text) return [];
+    if (queryVector) {
+      const queryModel = normalizeEmbeddingModel(queryVector.model);
+      if (!this.embeddingModel || !queryModel || queryModel !== this.embeddingModel) {
+        throw new TypeError(`Query vector model does not match ${this.embeddingModel ?? "a known embedding model"}`);
+      }
+    }
     const bounded = clampLimit(limit);
     const lexical = this.lexical(text, Math.max(20, bounded * 4));
     const vector = queryVector ? this.vectorSearch(queryVector, Math.max(20, bounded * 4)) : [];
@@ -493,23 +462,29 @@ export class PeerSyncStore {
 
   getTrace(id: string, nodeId?: string): PeerTraceDetail | null {
     const source = this.requireSource();
+    const replica = this.requireReplica();
     if (id.startsWith("replica~")) {
       const rest = id.slice(8);
       const split = rest.indexOf("~");
       if (split <= 0) return null;
       return this.getReplicaTrace(rest.slice(split + 1), rest.slice(0, split));
     }
-    if (nodeId && nodeId !== this.options.nodeId) return this.getReplicaTrace(id, nodeId);
+    if (nodeId && nodeId !== this.options.nodeId) {
+      const replicaTrace = this.getReplicaTrace(id, nodeId);
+      if (replicaTrace) return replicaTrace;
+    }
     if (!this.sourceTables.has("traces")) return null;
+    const profile = this.profilePredicate(source, "traces");
     const trace = source
-      .prepare("SELECT * FROM traces WHERE id = ?")
-      .get(id) as Record<string, unknown> | undefined;
+      .prepare(`SELECT * FROM traces WHERE ${profile.sql} AND id = @id`)
+      .get({ ...profile.params, id }) as Record<string, unknown> | undefined;
     if (!trace) return null;
+    const vectors = buildVectors("trace", trace, this.embeddingModel);
     const payload = buildPayload("trace", trace);
     return this.traceDto(trace, payload, this.options.nodeId, id, revisionOf(
       safeInteger(trace["ts"]) ?? 0,
       payload,
-      buildVectors("trace", trace),
+      vectors,
     ));
   }
 
@@ -525,25 +500,33 @@ export class PeerSyncStore {
     const sourceCounts = emptyCounts();
     for (const spec of TABLE_SPECS) {
       if (!this.sourceTables.has(spec.table)) continue;
+      const profile = this.profilePredicate(source, spec.table);
       const row = source
-        .prepare(`SELECT COUNT(*) AS n FROM ${quoteIdentifier(spec.table)}`)
-        .get() as { n: number };
+        .prepare(`SELECT COUNT(*) AS n FROM ${quoteIdentifier(spec.table)} WHERE ${profile.sql}`)
+        .get(profile.params) as { n: number };
       sourceCounts[spec.kind] = Number(row.n) || 0;
     }
     const replicaCounts = emptyCounts();
     for (const row of replica
-      .prepare("SELECT kind, COUNT(*) AS n FROM peer_items GROUP BY kind")
-      .all() as Array<{ kind: PeerSyncKind; n: number }>) {
+      .prepare("SELECT kind, COUNT(*) AS n FROM peer_items WHERE profile_id = ? GROUP BY kind")
+      .all([this.profileId]) as Array<{ kind: PeerSyncKind; n: number }>) {
       replicaCounts[row.kind] = Number(row.n) || 0;
     }
     const vectorCount = replica
-      .prepare("SELECT COUNT(*) AS n FROM peer_vectors")
-      .get() as { n: number };
+      .prepare("SELECT COUNT(*) AS n FROM peer_vectors WHERE profile_id = ?")
+      .get([this.profileId]) as { n: number };
     const origins = replica
-      .prepare("SELECT origin_node AS nodeId, COUNT(*) AS items FROM peer_items GROUP BY origin_node ORDER BY origin_node")
-      .all() as Array<{ nodeId: string; items: number }>;
+      .prepare("SELECT origin_node AS nodeId, COUNT(*) AS items FROM peer_items WHERE profile_id = ? GROUP BY origin_node ORDER BY origin_node")
+      .all([this.profileId]) as Array<{ nodeId: string; items: number }>;
+    const sourceProfiles = replica
+      .prepare("SELECT DISTINCT source_profile_id AS profileId FROM peer_items WHERE profile_id = ? ORDER BY source_profile_id")
+      .all([this.profileId])
+      .map(row => String((row as { profileId: unknown }).profileId));
     return {
       nodeId: this.options.nodeId,
+      profileId: this.profileId,
+      sourceProfiles,
+      ...(this.embeddingModel ? { embeddingModel: this.embeddingModel } : {}),
       sourceDb: this.options.dbPath,
       replicaDb: this.replicaPath,
       source: sourceCounts,
@@ -559,9 +542,10 @@ export class PeerSyncStore {
     const hits: PeerRetrievalHit[] = [];
     for (const spec of TABLE_SPECS) {
       if (this.sourceTables.has(spec.table)) {
+        const profile = this.profilePredicate(source, spec.table);
         for (const row of source
-          .prepare(`SELECT * FROM ${quoteIdentifier(spec.table)} LIMIT ${SEARCH_SCAN_LIMIT}`)
-          .all() as Array<Record<string, unknown>>) {
+          .prepare(`SELECT * FROM ${quoteIdentifier(spec.table)} WHERE ${profile.sql} LIMIT ${SEARCH_SCAN_LIMIT}`)
+          .all(profile.params) as Array<Record<string, unknown>>) {
           const payload = buildPayload(spec.kind, row);
           const score = lexicalScore(query, payload);
           if (score <= 0) continue;
@@ -572,29 +556,34 @@ export class PeerSyncStore {
       }
     }
     for (const row of replica
-      .prepare("SELECT * FROM peer_items ORDER BY imported_at DESC LIMIT ?")
-      .all([SEARCH_SCAN_LIMIT]) as ReplicaRow[]) {
+      .prepare("SELECT * FROM peer_items WHERE profile_id = ? ORDER BY imported_at DESC LIMIT ?")
+      .all([this.profileId, SEARCH_SCAN_LIMIT]) as ReplicaRow[]) {
       const payload = parseJsonObject(row.payload_json);
       const score = lexicalScore(query, payload);
       if (score <= 0) continue;
-      hits.push(this.hit("replica", row.origin_node, row.kind, row.id, score, payload));
+      hits.push(this.hit("replica", row.origin_node, row.kind, row.id, score, payload, row.source_profile_id));
     }
     return hits.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
   private vectorSearch(query: PeerSearchVector, limit: number): PeerRetrievalHit[] {
-    if (!query.model.trim() || query.values.length === 0) return [];
+    const queryModel = normalizeEmbeddingModel(query.model);
+    if (!queryModel || query.values.length === 0) return [];
+    if (!this.embeddingModel || queryModel !== this.embeddingModel) {
+      throw new TypeError(`Query vector model does not match ${this.embeddingModel ?? "a known embedding model"}`);
+    }
     if (!query.values.every(isFiniteFloat)) throw new TypeError("Query vector contains a non-finite value");
     const source = this.requireSource();
     const replica = this.requireReplica();
     const hits: PeerRetrievalHit[] = [];
     for (const spec of TABLE_SPECS) {
       if (!this.sourceTables.has(spec.table)) continue;
+      const profile = this.profilePredicate(source, spec.table);
       for (const row of source
-        .prepare(`SELECT * FROM ${quoteIdentifier(spec.table)} LIMIT ${SEARCH_SCAN_LIMIT}`)
-        .all() as Array<Record<string, unknown>>) {
-        for (const vector of buildVectors(spec.kind, row)) {
-          if (vector.model !== query.model || vector.dimension !== query.values.length) continue;
+        .prepare(`SELECT * FROM ${quoteIdentifier(spec.table)} WHERE ${profile.sql} LIMIT ${SEARCH_SCAN_LIMIT}`)
+        .all(profile.params) as Array<Record<string, unknown>>) {
+        for (const vector of buildVectors(spec.kind, row, this.embeddingModel)) {
+          if (vector.model !== queryModel || vector.dimension !== query.values.length) continue;
           const score = cosine(query.values, vector.values);
           const id = safeString(row[spec.idColumn], 512);
           if (!id || score <= 0) continue;
@@ -605,8 +594,9 @@ export class PeerSyncStore {
       }
     }
     const vectors = replica
-      .prepare("SELECT * FROM peer_vectors WHERE model = ? AND dimension = ? LIMIT ?")
-      .all([query.model, query.values.length, SEARCH_SCAN_LIMIT]) as Array<{
+      .prepare("SELECT * FROM peer_vectors WHERE profile_id = ? AND model = ? AND dimension = ? LIMIT ?")
+      .all([this.profileId, queryModel, query.values.length, SEARCH_SCAN_LIMIT]) as Array<{
+        profile_id: string;
         origin_node: string;
         kind: PeerSyncKind;
         item_id: string;
@@ -615,13 +605,15 @@ export class PeerSyncStore {
         values_json: string;
       }>;
     for (const vector of vectors) {
-      if (vector.model !== query.model || vector.dimension !== query.values.length) continue;
+      if (vector.model !== queryModel || vector.dimension !== query.values.length) continue;
       const values = JSON.parse(vector.values_json) as number[];
       const score = cosine(query.values, values);
       if (score <= 0) continue;
       const item = replica
-        .prepare("SELECT payload_json FROM peer_items WHERE origin_node = ? AND kind = ? AND id = ?")
-        .get([vector.origin_node, vector.kind, vector.item_id]) as { payload_json: string } | undefined;
+        .prepare("SELECT payload_json, source_profile_id FROM peer_items WHERE profile_id = ? AND origin_node = ? AND kind = ? AND id = ? ORDER BY imported_at DESC LIMIT 1")
+        .get([this.profileId, vector.origin_node, vector.kind, vector.item_id]) as
+          | { payload_json: string; source_profile_id: string }
+          | undefined;
       if (!item) continue;
       const hit = this.hit(
         "replica",
@@ -630,6 +622,7 @@ export class PeerSyncStore {
         vector.item_id,
         score,
         parseJsonObject(item.payload_json),
+        item.source_profile_id,
       );
       hit.vectorScore = score;
       hits.push(hit);
@@ -644,6 +637,7 @@ export class PeerSyncStore {
     id: string,
     score: number,
     payload: Record<string, unknown>,
+    sourceProfileId?: string,
   ): PeerRetrievalHit {
     const remoteId = origin === "local" ? `remote~${id}` : `replica~${originNode}~${id}`;
     return {
@@ -651,9 +645,11 @@ export class PeerSyncStore {
       refId: remoteId,
       refKind: kind === "world_model" ? "world-model" : kind === "policy" ? "experience" : kind,
       score: Math.max(0, Math.min(1, score)),
-      snippet: snippetOf(payload),
+      snippet: `${snippetOf(payload)}${snippetOf(payload) ? "\n" : ""}replica~${originNode}~${id}`,
+      ownerProfileId: this.profileId,
       origin,
       originNode,
+      ...(sourceProfileId ? { sourceProfileId } : {}),
       remoteId,
       replica: origin === "replica",
     };
@@ -663,20 +659,26 @@ export class PeerSyncStore {
     const replica = this.requireReplica();
     const row = (nodeId
       ? replica
-          .prepare("SELECT * FROM peer_items WHERE origin_node = ? AND kind = 'trace' AND id = ?")
-          .get([nodeId, id])
+          .prepare("SELECT * FROM peer_items WHERE profile_id = ? AND origin_node = ? AND kind = 'trace' AND id = ? ORDER BY imported_at DESC LIMIT 1")
+          .get([this.profileId, nodeId, id])
       : replica
-          .prepare("SELECT * FROM peer_items WHERE kind = 'trace' AND id = ? ORDER BY imported_at DESC LIMIT 1")
-          .get(id)) as ReplicaRow | undefined;
+          .prepare("SELECT * FROM peer_items WHERE profile_id = ? AND kind = 'trace' AND id = ? ORDER BY imported_at DESC LIMIT 1")
+          .get([this.profileId, id])) as ReplicaRow | undefined;
     if (!row) return null;
     const payload = parseJsonObject(row.payload_json);
-    return this.traceDto(
+    const detail = this.traceDto(
       { ...payload, id: row.id },
       payload,
       row.origin_node,
       `replica~${row.origin_node}~${row.id}`,
       row.revision,
+      row.source_profile_id,
     );
+    return {
+      ...detail,
+      ownerProfileId: this.profileId,
+      refId: detail.remoteId,
+    };
   }
 
   private traceDto(
@@ -685,10 +687,11 @@ export class PeerSyncStore {
     originNode: string,
     remoteId: string,
     revision: string,
+    sourceProfileId?: string,
   ): PeerTraceDetail {
     const id = safeString(source.id, 512) || safeString(payload.id, 512);
     const summary = safeString(payload.summary, 2_000);
-    const agentText = safeString(payload.agentText, 2_000) || summary;
+    const agentText = summary || "Remote memory summary unavailable.";
     return {
       id,
       episodeId: safeString(source.episode_id, 512) || safeString(payload.episodeId, 512),
@@ -697,7 +700,7 @@ export class PeerSyncStore {
       ownerProfileId: safeString(source.owner_profile_id, 128) || "default",
       ownerWorkspaceId: safeString(source.owner_workspace_id, 256) || null,
       ts: safeInteger(source.ts) ?? safeInteger(payload.ts) ?? 0,
-      userText: safeString(payload.userText, 2_000),
+      userText: "",
       agentText,
       summary: summary || null,
       tags: safeStringArray(payload.tags),
@@ -707,7 +710,9 @@ export class PeerSyncStore {
       priority: safeNumber(payload.priority),
       turnId: safeInteger(payload.ts) ?? 0,
       originNode,
+      ...(sourceProfileId ? { sourceProfileId } : {}),
       remoteId,
+      refId: remoteId,
       revision,
     };
   }
@@ -722,96 +727,17 @@ export class PeerSyncStore {
     return this.replica;
   }
 
-  private hasExportCandidatesAfter(
-    source: StorageDb,
-    cursor: { updated_at: number; kind: PeerSyncKind; id: string },
-  ): boolean {
-    for (const spec of TABLE_SPECS) {
-      if (!this.sourceTables.has(spec.table)) continue;
-      const available = new Set(
-        source
-          .prepare(`PRAGMA table_info(${quoteIdentifier(spec.table)})`)
-          .all()
-          .map((row) => String((row as { name: unknown }).name)),
-      );
-      const updatedExpression = updatedExpressionFor(spec, available);
-      if (!updatedExpression || !available.has(spec.idColumn)) continue;
-      const row = source
-        .prepare(`
-          SELECT 1 AS found
-            FROM ${quoteIdentifier(spec.table)}
-           WHERE ${updatedExpression} > @updated_at
-              OR (${updatedExpression} = @updated_at
-                  AND ${quoteIdentifier(spec.idColumn)} > @id)
-              OR (${updatedExpression} = @updated_at
-                  AND ${quoteIdentifier(spec.idColumn)} = @id
-                  AND @kind > @kind_cursor)
-           LIMIT 1`)
-        .get({
-          updated_at: cursor.updated_at,
-          id: cursor.id,
-          kind: KIND_ORDER[spec.kind],
-          kind_cursor: KIND_ORDER[cursor.kind],
-        });
-      if (row) return true;
-    }
-    return false;
-  }
-
-  private collectRevisionCandidates(
-    source: StorageDb,
-    candidates: CandidateRow[],
-    limit: number,
-  ): void {
-    for (const spec of TABLE_SPECS) {
-      if (!this.sourceTables.has(spec.table)) continue;
-      const available = new Set(
-        source
-          .prepare(`PRAGMA table_info(${quoteIdentifier(spec.table)})`)
-          .all()
-          .map((row) => String((row as { name: unknown }).name)),
-      );
-      const updatedExpression = updatedExpressionFor(spec, available);
-      if (!updatedExpression || !available.has(spec.idColumn)) continue;
-      const cols = spec.columns.filter((column) => available.has(column));
-      const payload = projectionColumns(cols, spec.kind);
-      const vectors = vectorColumns(spec.kind).filter((column) => available.has(column));
-      const select = [
-        `${updatedExpression} AS peer_updated_at`,
-        quoteIdentifier(spec.idColumn),
-        ...payload.map(quoteIdentifier),
-        ...vectors.map(quoteIdentifier),
-      ].join(", ");
-      const rows = source
-        .prepare(`
-          SELECT ${select}
-            FROM ${quoteIdentifier(spec.table)}
-           ORDER BY peer_updated_at DESC, ${quoteIdentifier(spec.idColumn)} DESC
-           LIMIT ?`)
-        .all(limit) as Array<Record<string, unknown>>;
-      for (const row of rows) {
-        const id = safeString(row[spec.idColumn], 512);
-        const updatedAt = safeInteger(row.peer_updated_at);
-        if (!id || updatedAt === undefined) continue;
-        const itemPayload = buildPayload(spec.kind, row);
-        const itemVectors = buildVectors(spec.kind, row);
-        candidates.push({
-          kind: spec.kind,
-          id,
-          revision: revisionOf(updatedAt, itemPayload, itemVectors),
-          updated_at: updatedAt,
-          payload_json: JSON.stringify(itemPayload),
-          vectors_json: JSON.stringify(itemVectors),
-        });
-      }
-    }
-    candidates.sort(compareCandidates);
-  }
-
   private installReplicaSchema(db: StorageDb): void {
+    const version = db.prepare("PRAGMA user_version").get() as { user_version?: unknown } | undefined;
+    if (Number(version?.user_version ?? 0) === 3) {
+      this.ensureReplicaSchema(db);
+      return;
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS peer_items (
+        profile_id TEXT NOT NULL DEFAULT 'default',
         origin_node TEXT NOT NULL,
+        source_profile_id TEXT NOT NULL DEFAULT 'default',
         kind TEXT NOT NULL CHECK (kind IN ('trace','policy','world_model','skill')),
         id TEXT NOT NULL,
         revision TEXT NOT NULL,
@@ -819,9 +745,10 @@ export class PeerSyncStore {
         vectors_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(vectors_json)),
         source_updated_at INTEGER NOT NULL,
         imported_at INTEGER NOT NULL,
-        PRIMARY KEY (origin_node, kind, id)
+        PRIMARY KEY (profile_id, origin_node, source_profile_id, kind, id)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS peer_vectors (
+        profile_id TEXT NOT NULL DEFAULT 'default',
         origin_node TEXT NOT NULL,
         kind TEXT NOT NULL,
         item_id TEXT NOT NULL,
@@ -829,9 +756,10 @@ export class PeerSyncStore {
         model TEXT NOT NULL,
         dimension INTEGER NOT NULL,
         values_json TEXT NOT NULL CHECK (json_valid(values_json)),
-        PRIMARY KEY (origin_node, kind, item_id, slot, model)
+        PRIMARY KEY (profile_id, origin_node, kind, item_id, slot, model)
       ) STRICT;
       CREATE VIRTUAL TABLE IF NOT EXISTS peer_items_fts USING fts5(
+        profile_id UNINDEXED,
         origin_node UNINDEXED,
         kind UNINDEXED,
         item_id UNINDEXED,
@@ -839,24 +767,125 @@ export class PeerSyncStore {
         tokenize = 'unicode61'
       );
       CREATE TRIGGER IF NOT EXISTS peer_items_ai AFTER INSERT ON peer_items BEGIN
-        INSERT INTO peer_items_fts(origin_node, kind, item_id, text)
-        VALUES (new.origin_node, new.kind, new.id, new.payload_json);
+        INSERT INTO peer_items_fts(profile_id, origin_node, kind, item_id, text)
+        VALUES (new.profile_id, new.origin_node, new.kind, new.id, new.payload_json);
       END;
       CREATE TRIGGER IF NOT EXISTS peer_items_au AFTER UPDATE ON peer_items BEGIN
         DELETE FROM peer_items_fts
-         WHERE origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
-        INSERT INTO peer_items_fts(origin_node, kind, item_id, text)
-        VALUES (new.origin_node, new.kind, new.id, new.payload_json);
+         WHERE profile_id = old.profile_id AND origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
+        INSERT INTO peer_items_fts(profile_id, origin_node, kind, item_id, text)
+        VALUES (new.profile_id, new.origin_node, new.kind, new.id, new.payload_json);
       END;
       CREATE TRIGGER IF NOT EXISTS peer_items_ad AFTER DELETE ON peer_items BEGIN
         DELETE FROM peer_items_fts
-         WHERE origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
+         WHERE profile_id = old.profile_id AND origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
         DELETE FROM peer_vectors
-         WHERE origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
+         WHERE profile_id = old.profile_id AND origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
       END;
-      CREATE INDEX IF NOT EXISTS idx_peer_items_origin ON peer_items(origin_node, kind, id);
-      CREATE INDEX IF NOT EXISTS idx_peer_vectors_lookup ON peer_vectors(model, dimension);
+      CREATE INDEX IF NOT EXISTS idx_peer_items_origin ON peer_items(profile_id, origin_node, kind, id);
+      CREATE INDEX IF NOT EXISTS idx_peer_vectors_lookup ON peer_vectors(profile_id, model, dimension);
     `);
+    migrateLegacyReplicaSchema(db);
+    this.ensureReplicaSchema(db);
+    db.exec("PRAGMA user_version = 3");
+  }
+
+  private ensureReplicaSchema(db: StorageDb): void {
+    const itemColumns = tableColumns(db, "peer_items");
+    const vectorColumns = tableColumns(db, "peer_vectors");
+    const ftsColumns = tableColumns(db, "peer_items_fts");
+    if (
+      !itemColumns.has("profile_id") ||
+      !vectorColumns.has("profile_id") ||
+      !ftsColumns.has("profile_id") ||
+      !itemColumns.has("source_profile_id")
+    ) {
+      throw new Error("PeerSync replica schema is incompatible");
+    }
+  }
+
+  private sourceKeys(
+    source: StorageDb,
+    cursor: CursorState | undefined,
+    limit: number,
+  ): Array<{ kind: PeerSyncKind; id: string }> {
+    const keys: Array<{ kind: PeerSyncKind; id: string }> = [];
+    // `rev` without kind/id means the previous sweep completed. The next
+    // request deliberately starts a fresh full-table pass so rows whose
+    // timestamp never advances (notably value/alpha updates on traces) are
+    // still compared by content revision.
+    let active = !cursor || cursor.rev !== undefined;
+    for (const spec of TABLE_SPECS) {
+      if (!this.sourceTables.has(spec.table)) continue;
+      const started = !cursor || active || spec.kind === cursor.kind;
+      if (!started) continue;
+      const available = tableColumns(source, spec.table);
+      if (!available.has(spec.idColumn)) continue;
+      const profile = this.profilePredicate(source, spec.table);
+      const after = cursor && spec.kind === cursor.kind ? `AND ${quoteIdentifier(spec.idColumn)} > @after_id` : "";
+      const params: Record<string, unknown> = { key_limit: limit - keys.length, ...profile.params };
+      if (after) params.after_id = cursor?.id;
+      const rows = source
+        .prepare(`
+          SELECT ${quoteIdentifier(spec.idColumn)} AS id
+            FROM ${quoteIdentifier(spec.table)}
+           WHERE ${profile.sql} ${after}
+           ORDER BY ${quoteIdentifier(spec.idColumn)} ASC
+           LIMIT @key_limit`)
+        .all(params) as Array<{ id: unknown }>;
+      for (const row of rows) {
+        const id = safeString(row.id, 512);
+        if (id) keys.push({ kind: spec.kind, id });
+      }
+      if (cursor?.kind === spec.kind) active = true;
+      if (keys.length >= limit) break;
+    }
+    return keys;
+  }
+
+  private exportItem(source: StorageDb, key: { kind: PeerSyncKind; id: string }): PeerSyncItem {
+    const spec = TABLE_SPECS.find(candidate => candidate.kind === key.kind);
+    if (!spec || !this.sourceTables.has(spec.table)) throw new Error("PeerSync source table is unavailable");
+    const available = tableColumns(source, spec.table);
+    const cols = spec.columns.filter(column => available.has(column));
+    const payloadColumns = projectionColumns(cols, spec.kind);
+    const vectorColumns = vectorFields(spec.kind).filter(column => available.has(column));
+    const profile = this.profilePredicate(source, spec.table);
+    const select = [
+      ...payloadColumns.map(quoteIdentifier),
+      ...vectorColumns.map(quoteIdentifier),
+    ].join(", ");
+    const row = source
+      .prepare(`
+        SELECT ${select || "1 AS empty"}
+          FROM ${quoteIdentifier(spec.table)}
+         WHERE ${profile.sql} AND ${quoteIdentifier(spec.idColumn)} = @id
+         LIMIT 1`)
+      .get({ ...profile.params, id: key.id }) as Record<string, unknown> | undefined;
+    if (!row) throw new Error("PeerSync item disappeared during export");
+    const payload = buildPayload(spec.kind, row);
+    const vectors = buildVectors(spec.kind, row, this.embeddingModel);
+    const updatedAt = payloadTime(payload);
+    return {
+      kind: key.kind,
+      id: key.id,
+      revision: revisionOf(updatedAt, payload, vectors),
+      payload,
+      vectors,
+    };
+  }
+
+  private profilePredicate(source: StorageDb, table: string): { sql: string; params: Record<string, unknown> } {
+    const columns = tableColumns(source, table);
+    return columns.has("owner_profile_id") && columns.has("owner_agent_kind")
+      ? {
+          sql: "owner_agent_kind = @profile_agent_kind AND owner_profile_id = @profile_id",
+          params: {
+            profile_agent_kind: "deepseek-harness",
+            profile_id: this.profileId,
+          },
+        }
+      : { sql: "1 = 0", params: {} };
   }
 }
 
@@ -864,13 +893,25 @@ function validatePage(
   page: unknown,
   expectedNodeId: string,
   localNodeId: string,
-): { originNode: string; items: Array<PeerSyncItem & { sourceUpdatedAt: number }> } {
+  expectedSourceProfileId?: string,
+): {
+  originNode: string;
+  sourceProfileId: string;
+  items: Array<PeerSyncItem & { sourceUpdatedAt: number }>;
+} {
   if (!page || typeof page !== "object" || Array.isArray(page)) throw new TypeError("Invalid peer page");
   const raw = page as Record<string, unknown>;
   if (raw.protocol !== PEER_SYNC_PROTOCOL) throw new TypeError("Unsupported peer protocol");
   if (!validNodeId(expectedNodeId)) throw new TypeError("Expected peer node id is invalid");
   if (raw.nodeId !== expectedNodeId) throw new TypeError("Peer node id does not match");
   if (raw.nodeId === localNodeId) throw new TypeError("Peer page must originate from another node");
+  if (typeof raw.profileId !== "string" || !raw.profileId.trim()) {
+    throw new TypeError("Peer page source profile is missing or invalid");
+  }
+  const sourceProfileId = normalizeProfileId(raw.profileId);
+  if (expectedSourceProfileId !== undefined && sourceProfileId !== normalizeProfileId(expectedSourceProfileId)) {
+    throw new TypeError("Peer page source profile does not match the paired peer");
+  }
   if (typeof raw.done !== "boolean") throw new TypeError("Peer page done flag is invalid");
   if (!Array.isArray(raw.items) || raw.items.length > PEER_SYNC_MAX_PAGE_ITEMS) {
     throw new TypeError("Peer page item count is invalid");
@@ -894,6 +935,14 @@ function validatePage(
     ids.add(key);
     const payload = sanitizeForWire(item.payload as Record<string, unknown>);
     if (!isRecord(payload)) throw new TypeError("Invalid peer item payload");
+    const ownerAgentKind = payload.ownerAgentKind;
+    const ownerProfileId = payload.ownerProfileId;
+    if (typeof ownerProfileId !== "string" || normalizeProfileId(ownerProfileId) !== sourceProfileId) {
+      throw new TypeError("Peer item profile does not match the page");
+    }
+    if (typeof ownerAgentKind !== "string" || !ownerAgentKind.trim()) {
+      throw new TypeError("Peer item agent identity is missing");
+    }
     const vectors = sanitizeVectors(item.vectors as unknown[]);
     const sourceUpdatedAt = payloadTime(payload);
     return {
@@ -905,20 +954,18 @@ function validatePage(
       sourceUpdatedAt,
     };
   });
-  return { originNode: expectedNodeId, items };
+  return { originNode: expectedNodeId, sourceProfileId, items };
 }
 
 function buildPayload(kind: PeerSyncKind, row: Record<string, unknown>): Record<string, unknown> {
   const owner = {
-    ownerAgentKind: safeString(row["owner_agent_kind"], 128) || "unknown",
-    ownerProfileId: safeString(row["owner_profile_id"], 128) || "default",
+    ownerAgentKind: safeIdentifier(row["owner_agent_kind"], 128) || "unknown",
+    ownerProfileId: safeIdentifier(row["owner_profile_id"], 128) || "default",
     ownerWorkspaceId: safeString(row["owner_workspace_id"], 256) || null,
   };
   if (kind === "trace") {
     return wireRecord({
       summary: safeString(row["summary"], 2_000) || null,
-      userText: safeString(row["user_text"], 2_000),
-      agentText: safeString(row["agent_text"], 2_000),
       tags: safeJsonArray(row["tags_json"]),
       value: safeNumber(row["value"]),
       alpha: safeNumber(row["alpha"]),
@@ -944,8 +991,8 @@ function buildPayload(kind: PeerSyncKind, row: Record<string, unknown>): Record<
       confidence: safeNumber(row["confidence"]),
       preference: safeStringArray(guidance["preference"]),
       antiPattern: safeStringArray(guidance["antiPattern"]),
-      sourceEpisodeIds: safeJsonArray(row["source_episodes_json"]),
-      sourceTraceIds: safeJsonArray(row["source_trace_ids_json"]),
+      sourceEpisodeIds: safeIdentifierArray(row["source_episodes_json"]),
+      sourceTraceIds: safeIdentifierArray(row["source_trace_ids_json"]),
       createdAt: safeInteger(row["created_at"]),
       updatedAt: safeInteger(row["updated_at"]),
       editedAt: safeInteger(row["edited_at"]),
@@ -958,8 +1005,8 @@ function buildPayload(kind: PeerSyncKind, row: Record<string, unknown>): Record<
       body: safeString(row["body"], 4_000),
       structure: parseJsonObject(row["structure_json"]),
       domainTags: safeJsonArray(row["domain_tags_json"]),
-      policyIds: safeJsonArray(row["policy_ids_json"]),
-      sourceEpisodeIds: safeJsonArray(row["source_episodes_json"]),
+      policyIds: safeIdentifierArray(row["policy_ids_json"]),
+      sourceEpisodeIds: safeIdentifierArray(row["source_episodes_json"]),
       confidence: safeNumber(row["confidence"]),
       version: safeInteger(row["version"]) ?? 1,
       status: safeString(row["status"], 32),
@@ -979,9 +1026,9 @@ function buildPayload(kind: PeerSyncKind, row: Record<string, unknown>): Record<
     gain: safeNumber(row["gain"]),
     trialsAttempted: safeInteger(row["trials_attempted"]) ?? 0,
     trialsPassed: safeInteger(row["trials_passed"]) ?? 0,
-    sourcePolicyIds: safeJsonArray(row["source_policies_json"]),
-    sourceWorldModelIds: safeJsonArray(row["source_world_json"]),
-    evidenceAnchors: safeJsonArray(row["evidence_anchors_json"]),
+    sourcePolicyIds: safeIdentifierArray(row["source_policies_json"]),
+    sourceWorldModelIds: safeIdentifierArray(row["source_world_json"]),
+    evidenceAnchors: safeIdentifierArray(row["evidence_anchors_json"]),
     createdAt: safeInteger(row["created_at"]),
     updatedAt: safeInteger(row["updated_at"]),
     version: safeInteger(row["version"]) ?? 1,
@@ -990,15 +1037,20 @@ function buildPayload(kind: PeerSyncKind, row: Record<string, unknown>): Record<
   });
 }
 
-function buildVectors(kind: PeerSyncKind, row: Record<string, unknown>): PeerSyncVector[] {
+function buildVectors(
+  kind: PeerSyncKind,
+  row: Record<string, unknown>,
+  model: string | undefined,
+): PeerSyncVector[] {
+  if (!model) return [];
   const out: PeerSyncVector[] = [];
-  const slots = vectorColumns(kind);
+  const slots = vectorFields(kind);
   for (const slot of slots) {
     const vector = decodeVectorBlob(row[slot]);
     if (!vector) continue;
     out.push({
       slot: slot === "vec_summary" ? "summary" : slot === "vec_action" ? "action" : "content",
-      model: "local-embedding",
+      model,
       dimension: vector.length,
       values: vector,
     });
@@ -1006,27 +1058,15 @@ function buildVectors(kind: PeerSyncKind, row: Record<string, unknown>): PeerSyn
   return out;
 }
 
-function vectorColumns(kind: PeerSyncKind): string[] {
+function vectorFields(kind: PeerSyncKind): string[] {
   if (kind === "trace") return ["vec_summary", "vec_action"];
   return ["vec"];
 }
 
 function projectionColumns(columns: readonly string[], kind: PeerSyncKind): string[] {
   const blocked = new Set(["messages", "messages_json", "logs", "config", "raw_json"]);
-  const vector = new Set(vectorColumns(kind));
+  const vector = new Set(vectorFields(kind));
   return columns.filter((column) => !blocked.has(column) && !vector.has(column));
-}
-
-function updatedExpressionFor(spec: TableSpec, available: ReadonlySet<string>): string | undefined {
-  if (!available.has(spec.updatedColumn)) return undefined;
-  const candidates = [spec.updatedColumn];
-  if (spec.kind === "trace") {
-    for (const column of ["edited_at", "created_at", "last_seen_at"]) {
-      if (available.has(column)) candidates.push(column);
-    }
-  }
-  if (candidates.length === 1) return quoteIdentifier(candidates[0]!);
-  return `MAX(${candidates.map(quoteIdentifier).join(", ")})`;
 }
 
 function revisionOf(updatedAt: number, payload: Record<string, unknown>, vectors: PeerSyncVector[]): string {
@@ -1044,7 +1084,7 @@ function sanitizeForWire(value: unknown, depth = 0): unknown {
   if (typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      if (CREDENTIAL_KEY.test(key)) continue;
+      if (CREDENTIAL_KEY.test(key) || SENSITIVE_KEY.test(key)) continue;
       out[key] = sanitizeForWire(child, depth + 1);
     }
     return out;
@@ -1155,6 +1195,10 @@ function safeStringArray(value: unknown): string[] {
     : [];
 }
 
+function safeIdentifierArray(value: unknown): string[] {
+  return safeStringArray(value).filter(item => !GLOBAL_ID.test(item) && !isAbsolutePath(item));
+}
+
 function safeJsonArray(value: unknown): string[] {
   if (typeof value !== "string") return [];
   try {
@@ -1162,6 +1206,15 @@ function safeJsonArray(value: unknown): string[] {
   } catch {
     return [];
   }
+}
+
+function safeIdentifier(value: unknown, max: number): string {
+  const text = safeString(value, max);
+  return GLOBAL_ID.test(text) || isAbsolutePath(text) ? "" : text;
+}
+
+function isAbsolutePath(value: string): boolean {
+  return value.startsWith("\\\\") || WINDOWS_ID_PATH.test(value) || POSIX_HOME_PATH.test(value);
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> {
@@ -1212,12 +1265,6 @@ function clampLimit(value: number | undefined): number {
   return Math.min(PEER_SYNC_MAX_PAGE_ITEMS, Math.trunc(value));
 }
 
-function compareCandidates(a: { updated_at: number; kind: PeerSyncKind; id: string }, b: { updated_at: number; kind: PeerSyncKind; id: string }): number {
-  return a.updated_at - b.updated_at ||
-    a.id.localeCompare(b.id) ||
-    KIND_ORDER[a.kind] - KIND_ORDER[b.kind];
-}
-
 function encodeCursor(cursor: CursorState): string {
   return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
 }
@@ -1227,14 +1274,15 @@ function parseCursor(raw: string | undefined): CursorState | undefined {
   if (raw.length > 1_024) throw new TypeError("Peer cursor is too long");
   try {
     const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<CursorState>;
-    if (safeInteger(parsed.updatedAt) === undefined || !isKind(parsed.kind) || !safeString(parsed.id, 512)) {
+    const hasPage = isKind(parsed.kind) && Boolean(safeString(parsed.id, 512));
+    const hasRev = safeInteger(parsed.rev) !== undefined;
+    if (parsed.version !== 2 || (!hasPage && !hasRev)) {
       throw new Error("shape");
     }
     return {
-      updatedAt: safeInteger(parsed.updatedAt)!,
-      kind: parsed.kind,
-      id: String(parsed.id),
-      sweep: parsed.sweep === true,
+      version: 2,
+      ...(hasPage ? { kind: parsed.kind as PeerSyncKind, id: String(parsed.id) } : {}),
+      ...(hasRev ? { rev: safeInteger(parsed.rev) } : {}),
     };
   } catch {
     throw new TypeError("Peer cursor is invalid");
@@ -1243,4 +1291,127 @@ function parseCursor(raw: string | undefined): CursorState | undefined {
 
 function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
+}
+
+function tableColumns(source: StorageDb, table: string): Set<string> {
+  return new Set(
+    source
+      .prepare(`PRAGMA table_info(${quoteIdentifier(table)})`)
+      .all()
+      .map(row => String((row as { name: unknown }).name)),
+  );
+}
+
+function normalizeProfileId(value: string | undefined): string {
+  const normalized = String(value ?? "default")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized || "default";
+}
+
+function normalizeEmbeddingModel(value: string | undefined): string | undefined {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) return undefined;
+  return /^[^/\s]+\/\S+$/.test(normalized) ? normalized : undefined;
+}
+
+function readConfiguredEmbeddingModel(home: string, dataDir: string): string | undefined {
+  const candidates = [
+    path.join(path.resolve(home), "config.yaml"),
+    path.join(path.resolve(dataDir), "..", "config.yaml"),
+  ];
+  for (const configFile of candidates) {
+    if (!fs.existsSync(configFile)) continue;
+    try {
+    const raw = parseYaml(fs.readFileSync(configFile, "utf8"), configFile);
+    const embedding = isRecord(raw) && isRecord(raw.embedding) ? raw.embedding : undefined;
+    // DEFAULT_CONFIG is not lineage: only fields persisted in this profile
+    // may label existing vectors.
+    if (!embedding) return undefined;
+    const provider = typeof embedding.provider === "string" ? embedding.provider.trim() : "";
+    const model = typeof embedding.model === "string" ? embedding.model.trim() : "";
+    if (!provider || !model || embedding.dimensions !== undefined) return undefined;
+    return normalizeEmbeddingModel(provider && model ? `${provider}/${model}` : undefined);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function migrateLegacyReplicaSchema(db: StorageDb): void {
+  const itemColumns = tableColumns(db, "peer_items");
+  const vectorColumns = tableColumns(db, "peer_vectors");
+  const ftsColumns = tableColumns(db, "peer_items_fts");
+  if (
+    !itemColumns.has("profile_id") ||
+    !vectorColumns.has("profile_id") ||
+    !ftsColumns.has("profile_id") ||
+    itemColumns.has("source_profile_id")
+  ) return;
+  const schemaVersion = Number(db.prepare("PRAGMA user_version").get() as unknown);
+  if (schemaVersion === 1) throw new Error("PeerSync replica belongs to another profile");
+  db.exec(`
+    DROP TRIGGER IF EXISTS peer_items_ai;
+    DROP TRIGGER IF EXISTS peer_items_au;
+    DROP TRIGGER IF EXISTS peer_items_ad;
+    DROP TABLE IF EXISTS peer_items_fts;
+    DROP TABLE IF EXISTS peer_vectors;
+    DROP TABLE IF EXISTS peer_items;
+    PRAGMA user_version = 1;
+  `);
+  db.exec(`
+    CREATE TABLE peer_items (
+      profile_id TEXT NOT NULL DEFAULT 'default',
+      origin_node TEXT NOT NULL,
+      source_profile_id TEXT NOT NULL DEFAULT 'default',
+      kind TEXT NOT NULL CHECK (kind IN ('trace','policy','world_model','skill')),
+      id TEXT NOT NULL,
+      revision TEXT NOT NULL,
+      payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+      vectors_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(vectors_json)),
+      source_updated_at INTEGER NOT NULL,
+      imported_at INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, origin_node, source_profile_id, kind, id)
+    ) STRICT;
+    CREATE TABLE peer_vectors (
+      profile_id TEXT NOT NULL DEFAULT 'default',
+      origin_node TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      slot TEXT NOT NULL,
+      model TEXT NOT NULL,
+      dimension INTEGER NOT NULL,
+      values_json TEXT NOT NULL CHECK (json_valid(values_json)),
+      PRIMARY KEY (profile_id, origin_node, kind, item_id, slot, model)
+    ) STRICT;
+    CREATE VIRTUAL TABLE peer_items_fts USING fts5(
+      profile_id UNINDEXED,
+      origin_node UNINDEXED,
+      kind UNINDEXED,
+      item_id UNINDEXED,
+      text,
+      tokenize = 'unicode61'
+    );
+    CREATE TRIGGER peer_items_ai AFTER INSERT ON peer_items BEGIN
+      INSERT INTO peer_items_fts(profile_id, origin_node, kind, item_id, text)
+      VALUES (new.profile_id, new.origin_node, new.kind, new.id, new.payload_json);
+    END;
+    CREATE TRIGGER peer_items_au AFTER UPDATE ON peer_items BEGIN
+      DELETE FROM peer_items_fts
+       WHERE profile_id = old.profile_id AND origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
+      INSERT INTO peer_items_fts(profile_id, origin_node, kind, item_id, text)
+      VALUES (new.profile_id, new.origin_node, new.kind, new.id, new.payload_json);
+    END;
+    CREATE TRIGGER peer_items_ad AFTER DELETE ON peer_items BEGIN
+      DELETE FROM peer_items_fts
+       WHERE profile_id = old.profile_id AND origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
+      DELETE FROM peer_vectors
+       WHERE profile_id = old.profile_id AND origin_node = old.origin_node AND kind = old.kind AND item_id = old.id;
+    END;
+    CREATE INDEX idx_peer_items_origin ON peer_items(profile_id, origin_node, source_profile_id, kind, id);
+    CREATE INDEX idx_peer_vectors_lookup ON peer_vectors(profile_id, model, dimension);
+  `);
 }

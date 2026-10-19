@@ -71,6 +71,9 @@ function seedTrace(f: Fixture, id = "trace-1"): void {
     id,
     episodeId: "episode-1",
     sessionId: "session-1",
+    ownerAgentKind: "deepseek-harness",
+    ownerProfileId: "default",
+    ownerWorkspaceId: null,
     ts: 100,
     userText: "Please inspect the memory sync implementation.",
     agentText: "The implementation is ready.",
@@ -93,13 +96,27 @@ function pageOf(store: PeerSyncStore, options: { cursor?: string; limit?: number
   return store.exportPage(options);
 }
 
+const EMBEDDING = "local/Xenova/all-MiniLM-L6-v2";
+
+function openStore(f: Fixture, overrides: Partial<ConstructorParameters<typeof PeerSyncStore>[0]> = {}): PeerSyncStore {
+  const value = new PeerSyncStore({
+    home: f.root,
+    dbPath: f.sourcePath,
+    nodeId: "node-a",
+    profileId: "default",
+    embeddingModel: EMBEDDING,
+    ...overrides,
+  });
+  cleanups.push(() => value.close());
+  value.open();
+  return value;
+}
+
 describe("PeerSyncStore", () => {
   it("exports only summaries, structure and vector metadata", () => {
     const f = fixture();
     seedTrace(f);
-    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-a" });
-    cleanups.push(() => store.close());
-    store.open();
+    const store = openStore(f);
 
     const page = pageOf(store);
     expect(page.protocol).toBe(PEER_SYNC_PROTOCOL);
@@ -114,10 +131,142 @@ describe("PeerSyncStore", () => {
     expect(trace?.payload).not.toHaveProperty("messages");
     expect(trace?.payload).not.toHaveProperty("toolCalls");
     expect(trace?.vectors).toEqual([
-      { slot: "summary", model: "local-embedding", dimension: 3, values: [1, 0, 0] },
-      { slot: "action", model: "local-embedding", dimension: 3, values: [0, 1, 0] },
+      { slot: "summary", model: EMBEDDING, dimension: 3, values: [1, 0, 0] },
+      { slot: "action", model: EMBEDDING, dimension: 3, values: [0, 1, 0] },
     ]);
+    expect(trace?.payload).not.toHaveProperty("userText");
+    expect(trace?.payload).not.toHaveProperty("agentText");
+    expect(JSON.stringify(page)).not.toContain("Please inspect the memory sync implementation.");
+    expect(JSON.stringify(page)).not.toContain("The implementation is ready.");
     expect(JSON.stringify(page)).not.toContain(f.root);
+  });
+
+  it("reads the effective embedding identity from this profile's config", () => {
+    const f = fixture();
+    seedTrace(f);
+    fs.writeFileSync(path.join(f.root, "config.yaml"), [
+      "version: 1",
+      "embedding:",
+      "  provider: openai_compatible",
+      "  model: text-embedding-3-small",
+      "",
+    ].join("\n"));
+    const store = new PeerSyncStore({
+      home: f.root,
+      dbPath: f.sourcePath,
+      nodeId: "node-a",
+      profileId: "default",
+    });
+    cleanups.push(() => store.close());
+    store.open();
+    expect(store.stats().embeddingModel).toBe("openai_compatible/text-embedding-3-small");
+    expect(store.exportPage().items.find(item => item.id === "trace-1")?.vectors)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ model: "openai_compatible/text-embedding-3-small" }),
+      ]));
+  });
+
+  it("does not guess a vector model when no traceable identity is available", () => {
+    const f = fixture();
+    seedTrace(f);
+    fs.writeFileSync(path.join(f.root, "config.yaml"), "version: 1\nembedding:\n  provider: ''\n");
+    const store = new PeerSyncStore({
+      home: f.root,
+      dbPath: f.sourcePath,
+      nodeId: "node-a",
+      profileId: "default",
+      embeddingModel: undefined,
+    });
+    cleanups.push(() => store.close());
+    store.open();
+    expect(store.stats().embeddingModel).toBeUndefined();
+    expect(store.exportPage().items.find(item => item.id === "trace-1")?.vectors).toEqual([]);
+    expect(() => store.search("memory", 10, {
+      model: EMBEDDING,
+      values: [1, 0, 0],
+    })).toThrow(/known embedding model/i);
+  });
+
+  it("binds desktop to a differently named nanopi source profile without mixing local rows", () => {
+    const f = fixture();
+    seedTrace(f);
+    f.repos.traces.insert({
+      id: "trace-private",
+      episodeId: "episode-1",
+      sessionId: "session-1",
+      ownerAgentKind: "deepseek-harness",
+      ownerProfileId: "private",
+      ownerWorkspaceId: null,
+      ts: 101,
+      userText: "private text",
+      agentText: "private answer",
+      summary: "private profile summary",
+      tags: ["private"],
+      toolCalls: [],
+      reflection: null,
+      value: 0.1,
+      alpha: 0.2,
+      rHuman: null,
+      priority: 0.3,
+      vecSummary: vector([0, 1, 0]),
+      vecAction: null,
+      turnId: 101,
+      schemaVersion: 1,
+    });
+    f.repos.traces.insert({
+      id: "trace-same-profile-other-agent",
+      episodeId: "episode-1",
+      sessionId: "session-1",
+      ownerAgentKind: "openclaw",
+      ownerProfileId: "private",
+      ownerWorkspaceId: null,
+      ts: 102,
+      userText: "other agent text",
+      agentText: "other agent answer",
+      summary: "must not leave this agent",
+      tags: [],
+      toolCalls: [],
+      reflection: null,
+      value: 0,
+      alpha: 0,
+      rHuman: null,
+      priority: 0,
+      vecSummary: null,
+      vecAction: null,
+      turnId: 102,
+      schemaVersion: 1,
+    });
+    const source = openStore(f, { profileId: "private", nodeId: "server-nanopi" });
+    const desktop = openStore(f, { profileId: "desktop", nodeId: "desktop" });
+    const otherDesktop = openStore(f, { profileId: "desktop-other", nodeId: "desktop-other" });
+    expect(desktop.exportPage().items.some(item => item.id === "trace-private")).toBe(false);
+    const page = source.exportPage();
+    expect(page.profileId).toBe("private");
+    expect(page.items.some(item => item.id === "trace-private")).toBe(true);
+    expect(page.items.some(item => item.id === "trace-same-profile-other-agent")).toBe(false);
+    expect(page.items.every(item => item.payload.ownerProfileId === "private")).toBe(true);
+    expect(() => desktop.importPage(page, "server-nanopi", "nanopi")).toThrow(/profile/i);
+    expect(desktop.importPage({
+      ...page,
+      items: page.items.map(item => ({
+        ...item,
+        id: `${item.id}-mirror`,
+        revision: `${item.revision}-mirror`,
+      })),
+    }, "server-nanopi", "private").inserted).toBeGreaterThan(0);
+    expect(desktop.stats().sourceProfiles).toEqual(["private"]);
+    expect(desktop.search("private profile", 10).some(hit =>
+      hit.refId.startsWith("replica~server-nanopi~")
+      && hit.ownerProfileId === "desktop"
+      && hit.sourceProfileId === "private"
+    )).toBe(true);
+    expect(desktop.getTrace("trace-private-mirror", "server-nanopi")).toMatchObject({
+      ownerProfileId: "desktop",
+      sourceProfileId: "private",
+    });
+    expect(desktop.getTrace("trace-private")).toBeNull();
+    expect(otherDesktop.stats().replicas.trace).toBe(0);
+    expect(otherDesktop.search("private profile", 10)).toEqual([]);
   });
 
   it("redacts credential-shaped fields and does not re-export imported pages", () => {
@@ -125,6 +274,9 @@ describe("PeerSyncStore", () => {
     seedTrace(f);
     f.repos.policies.upsert({
       id: "policy-1",
+      ownerAgentKind: "deepseek-harness",
+      ownerProfileId: "default",
+      ownerWorkspaceId: null,
       title: "Never expose api_key=sk-super-secret-value",
       trigger: "password=supersecret",
       procedure: "Use the local mirror.",
@@ -140,9 +292,7 @@ describe("PeerSyncStore", () => {
       createdAt: 100,
       updatedAt: 100,
     });
-    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-a" });
-    cleanups.push(() => store.close());
-    store.open();
+    const store = openStore(f);
     const page = pageOf(store);
     expect(JSON.stringify(page)).not.toContain("sk-super-secret-value");
     expect(JSON.stringify(page)).not.toContain("supersecret");
@@ -150,15 +300,21 @@ describe("PeerSyncStore", () => {
     const imported = store.importPage({
       protocol: PEER_SYNC_PROTOCOL,
       nodeId: "node-b",
+      profileId: "default",
       done: true,
       items: [{
         kind: "policy",
         id: "remote-policy",
         revision: "r1",
-        payload: { title: "remote", updatedAt: 200 },
+        payload: {
+          title: "remote",
+          updatedAt: 200,
+          ownerAgentKind: "deepseek-harness",
+          ownerProfileId: "default",
+        },
         vectors: [],
       }],
-    }, "node-b");
+    }, "node-b", "default");
     expect(imported.inserted).toBe(1);
     const second = pageOf(store);
     expect(second.items.some((item) => item.id === "remote-policy")).toBe(false);
@@ -170,6 +326,9 @@ describe("PeerSyncStore", () => {
     for (let i = 0; i < 4; i++) {
       f.repos.skills.insert({
         id: `skill-${i}`,
+        ownerAgentKind: "deepseek-harness",
+        ownerProfileId: "default",
+        ownerWorkspaceId: null,
         name: `skill-${i}`,
         status: "active",
         invocationGuide: `guide-${i}`,
@@ -188,29 +347,48 @@ describe("PeerSyncStore", () => {
         version: 1,
       });
     }
-    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-a" });
-    cleanups.push(() => store.close());
-    store.open();
+    const store = openStore(f);
     const first = pageOf(store, { limit: 2 });
     expect(first.items).toHaveLength(2);
     expect(first.done).toBe(false);
     expect(first.nextCursor).toBeTruthy();
-    const second = pageOf(store, { cursor: first.nextCursor, limit: 50 });
-    expect(second.items.length).toBeGreaterThan(0);
+    let second = pageOf(store, { cursor: first.nextCursor, limit: 50 });
+    while (!second.done && second.nextCursor) {
+      const next = pageOf(store, { cursor: second.nextCursor, limit: 50 });
+      expect(next.items.length).toBeGreaterThan(0);
+      second = next;
+    }
+    expect(second.done).toBe(true);
+    expect(second.nextCursor).toBeTruthy();
     expect(new Set([...first.items, ...second.items].map((item) => item.id)).size)
       .toBe(first.items.length + second.items.length);
 
     f.repos.traces.updateScore("trace-1", { value: 0.9, alpha: 0.8, priority: 1 });
-    const sweep = pageOf(store, { cursor: second.nextCursor, limit: PEER_SYNC_MAX_PAGE_ITEMS });
-    expect(sweep.nextCursor).toBeTruthy();
-    const afterUpdate = pageOf(store, { cursor: sweep.nextCursor, limit: PEER_SYNC_MAX_PAGE_ITEMS });
-    expect(afterUpdate.items.some((item) => item.id === "trace-1")).toBe(true);
-    expect(afterUpdate.done).toBe(true);
-    expect(afterUpdate.nextCursor).toBeTruthy();
-    expect(pageOf(store, { cursor: afterUpdate.nextCursor }).nextCursor).toBeTruthy();
+    let sweepCursor = second.nextCursor;
+    let sawUpdatedTrace = false;
+    let sweepNext: string | undefined;
+    for (let page = 0; page < PEER_SYNC_MAX_PAGE_ITEMS; page++) {
+      const swept = pageOf(store, { cursor: sweepCursor, limit: PEER_SYNC_MAX_PAGE_ITEMS });
+      sawUpdatedTrace ||= swept.items.some(item => item.id === "trace-1" && item.payload.value === 0.9);
+      if (swept.done) {
+        expect(swept.nextCursor).toBeTruthy();
+        sweepNext = swept.nextCursor;
+        break;
+      }
+      sweepCursor = swept.nextCursor;
+    }
+    expect(sawUpdatedTrace).toBe(true);
+    expect(sweepNext).toBeTruthy();
+    expect(pageOf(store, { cursor: sweepNext }).nextCursor).toBeTruthy();
     store.close();
 
-    const reopened = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-a" });
+    const reopened = new PeerSyncStore({
+      home: f.root,
+      dbPath: f.sourcePath,
+      nodeId: "node-a",
+      profileId: "default",
+      embeddingModel: EMBEDDING,
+    });
     cleanups.push(() => reopened.close());
     reopened.open();
     expect(reopened.stats().source.trace).toBe(1);
@@ -221,6 +399,9 @@ describe("PeerSyncStore", () => {
     seedTrace(f);
     f.repos.policies.upsert({
       id: "policy-same-ts",
+      ownerAgentKind: "deepseek-harness",
+      ownerProfileId: "default",
+      ownerWorkspaceId: null,
       title: "same timestamp policy",
       trigger: "",
       procedure: "",
@@ -236,9 +417,7 @@ describe("PeerSyncStore", () => {
       createdAt: 100,
       updatedAt: 100,
     });
-    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-a" });
-    cleanups.push(() => store.close());
-    store.open();
+    const store = openStore(f);
     const seen: string[] = [];
     let cursor: string | undefined;
     for (let i = 0; i < 4; i++) {
@@ -255,27 +434,36 @@ describe("PeerSyncStore", () => {
   it("imports idempotently and rejects malicious or incompatible pages", () => {
     const f = fixture();
     seedTrace(f);
-    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-a" });
-    cleanups.push(() => store.close());
-    store.open();
+    const store = openStore(f);
     const remote: PeerSyncPage = {
       protocol: PEER_SYNC_PROTOCOL,
       nodeId: "node-b",
+      profileId: "default",
       done: true,
       items: [{
         kind: "trace",
         id: "trace-b",
         revision: "rev-1",
-        payload: { summary: "remote summary", ts: 200 },
+        payload: {
+          summary: "remote summary",
+          ts: 200,
+          ownerAgentKind: "deepseek-harness",
+          ownerProfileId: "default",
+        },
         vectors: [{ slot: "summary", model: "m1", dimension: 2, values: [1, 0] }],
       }],
     };
-    expect(store.importPage(remote, "node-b")).toEqual({ inserted: 1, updated: 0, skipped: 0 });
-    expect(store.importPage(remote, "node-b")).toEqual({ inserted: 0, updated: 0, skipped: 1 });
+    expect(store.importPage(remote, "node-b", "default")).toEqual({ inserted: 1, updated: 0, skipped: 0 });
+    expect(store.importPage(remote, "node-b", "default")).toEqual({ inserted: 0, updated: 0, skipped: 1 });
     expect(store.stats().replicas.trace).toBe(1);
-    expect(() => store.importPage(remote, "node-c")).toThrow(/node id/i);
-    expect(() => store.importPage({ ...remote, protocol: "wrong" }, "node-b")).toThrow(/protocol/i);
-    expect(() => store.importPage({ ...remote, items: [{ ...remote.items[0], kind: "messages" }] }, "node-b"))
+    expect(() => store.importPage(remote, "node-c", "default")).toThrow(/node id/i);
+    expect(() => store.importPage({ ...remote, profileId: "other" }, "node-b", "default"))
+      .toThrow(/profile/i);
+    expect(() => store.importPage({ ...remote, profileId: undefined }, "node-b", "default"))
+      .toThrow(/profile/i);
+    expect(() => store.importPage(remote, "node-b", "other")).toThrow(/profile/i);
+    expect(() => store.importPage({ ...remote, protocol: "wrong" }, "node-b", "default")).toThrow(/protocol/i);
+    expect(() => store.importPage({ ...remote, items: [{ ...remote.items[0], kind: "messages" }] }, "node-b", "default"))
       .toThrow(/kind/i);
     expect(() => store.importPage({
       ...remote,
@@ -283,38 +471,44 @@ describe("PeerSyncStore", () => {
         ...remote.items[0],
         vectors: [{ slot: "summary", model: "m1", dimension: 2, values: [1, Number.NaN] }],
       }],
-    }, "node-b")).toThrow(/non-finite/i);
+    }, "node-b", "default")).toThrow(/non-finite/i);
     expect(store.stats().source.trace).toBe(1);
   });
 
   it("searches lexical and vector mirrors while preserving origin labels", () => {
     const f = fixture();
     seedTrace(f);
-    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-a" });
-    cleanups.push(() => store.close());
-    store.open();
+    const store = openStore(f);
     store.importPage({
       protocol: PEER_SYNC_PROTOCOL,
       nodeId: "node-b",
+      profileId: "default",
       done: true,
       items: [{
         kind: "trace",
         id: "trace-b",
         revision: "rev-b",
-        payload: { summary: "remote memory sync summary", ts: 200 },
-        vectors: [{ slot: "summary", model: "m1", dimension: 3, values: [1, 0, 0] }],
+        payload: {
+          summary: "remote memory sync summary",
+          ts: 200,
+          ownerAgentKind: "deepseek-harness",
+          ownerProfileId: "default",
+        },
+        vectors: [{ slot: "summary", model: EMBEDDING, dimension: 3, values: [1, 0, 0] }],
       }],
-    }, "node-b");
-    const hits = store.search("memory sync", 10, { model: "m1", values: [1, 0, 0] });
+    }, "node-b", "default");
+    const hits = store.search("memory sync", 10, { model: EMBEDDING, values: [1, 0, 0] });
     expect(hits.some((hit) => hit.refId === "remote~trace-1" && hit.origin === "local")).toBe(true);
     expect(hits.some((hit) => hit.refId === "replica~node-b~trace-b" && hit.originNode === "node-b")).toBe(true);
-    expect(store.search("memory sync", 10, { model: "other", values: [1, 0, 0] })
-      .some((hit) => hit.vectorScore !== undefined)).toBe(false);
+    expect(() => store.search("memory sync", 10, { model: "other", values: [1, 0, 0] }))
+      .toThrow(/does not match/i);
+    expect(store.search("memory sync", 10, { model: EMBEDDING, values: [1, 0, 0] })
+      .some((hit) => hit.vectorScore !== undefined)).toBe(true);
     expect(store.getTrace("trace-1")).toMatchObject({
       id: "trace-1",
       episodeId: "episode-1",
       sessionId: "session-1",
-      agentText: "The implementation is ready.",
+      agentText: "Memory sync implementation summary",
       toolCalls: [],
       turnId: 100,
       originNode: "node-a",
@@ -325,8 +519,14 @@ describe("PeerSyncStore", () => {
       agentText: "remote memory sync summary",
       originNode: "node-b",
       remoteId: "replica~node-b~trace-b",
+      refId: "replica~node-b~trace-b",
     });
-    expect(store.getTrace("trace-b", "node-b")).toMatchObject({ originNode: "node-b" });
+    expect(store.getTrace("trace-b", "node-b")).toMatchObject({
+      id: "trace-b",
+      originNode: "node-b",
+      refId: "replica~node-b~trace-b",
+    });
+    expect(store.getTrace("trace-1", "node-b")).toMatchObject({ originNode: "node-a" });
   });
 
   it("skips absent source tables safely and enforces bounded page sizes", () => {
@@ -338,7 +538,12 @@ describe("PeerSyncStore", () => {
       db.close();
       fs.rmSync(root, { recursive: true, force: true });
     });
-    const store = new PeerSyncStore({ home: root, dbPath: sourcePath, nodeId: "node-empty" });
+    const store = new PeerSyncStore({
+      home: root,
+      dbPath: sourcePath,
+      nodeId: "node-empty",
+      profileId: "default",
+    });
     cleanups.push(() => store.close());
     store.open();
     expect(store.exportPage()).toMatchObject({ protocol: PEER_SYNC_PROTOCOL, done: true, items: [] });
@@ -358,7 +563,13 @@ describe("PeerSyncStore", () => {
     expect(loadSqliteDriver().engine).toBe("node:sqlite");
     const f = fixture();
     seedTrace(f);
-    const store = new PeerSyncStore({ home: f.root, dbPath: f.sourcePath, nodeId: "node-fallback" });
+    const store = new PeerSyncStore({
+      home: f.root,
+      dbPath: f.sourcePath,
+      nodeId: "node-fallback",
+      profileId: "default",
+      embeddingModel: EMBEDDING,
+    });
     cleanups.push(() => store.close());
     store.open();
     const page = store.exportPage({ limit: 20 });
@@ -366,13 +577,19 @@ describe("PeerSyncStore", () => {
     expect(store.importPage({
       protocol: PEER_SYNC_PROTOCOL,
       nodeId: "node-peer",
+      profileId: "default",
       done: true,
       items: page.items.map((item) => ({
         ...item,
         id: `${item.id}-mirror`,
         revision: `${item.revision}-mirror`,
+        payload: {
+          ownerAgentKind: "deepseek-harness",
+          ownerProfileId: "default",
+          ...item.payload,
+        },
       })),
-    }, "node-peer").inserted).toBeGreaterThan(0);
+    }, "node-peer", "default").inserted).toBeGreaterThan(0);
     expect(store.stats().replicas.trace).toBeGreaterThan(0);
   });
 });
