@@ -215,4 +215,3 @@ eight seconds, still respecting an earlier caller deadline or cancellation.
   attribution and the license files shipped in this repository.
 
 The upstream README is preserved verbatim as [`README.upstream.md`](./README.upstream.md).
-
