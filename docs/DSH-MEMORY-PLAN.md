@@ -24,18 +24,18 @@ MCP credentials grant no Viewer settings or import access. The Viewer retains
 its password/session gate. New Codex sessions or an MCP reconnect discover newly
 registered tools; registration is not itself proof of real conversation recall.
 
-## Specified remote recall
+## Peer network and logical mirrors
 
-Implemented in `2.0.16-dsh.5`: one explicit authenticated peer, independently
-bounded local/remote queries, source labels, local-only peer dispatch to prevent
-forwarding loops, and read-only trace detail. Optional plugin-owned SSH transport
-reuses existing key/known-host configuration and stops on plugin disposal. This
-does not scan a LAN or select models by discovery. A DSH-only server does not
-need Codex or history extraction enabled to query the local peer.
+Implemented in `2.0.16-dsh.6`: signed LAN discovery, direct private peer queries,
+configured HTTPS fallback, existing WebOS Owner-session authentication and
+outbound reverse-query polling for desktops behind NAT. The plugin no longer
+launches SSH. A DSH-only server needs no Codex installation or history reader.
 
-Remote writes, database synchronization, retrying write queues, deletion
-propagation and conflict resolution remain unimplemented. Neither a live SQLite
-copy nor automatic raw-session upload is used as a synchronization protocol.
+Opt-in logical synchronization imports memory and compatible vector metadata
+into a separate source-owned replica store; it does not overwrite either local
+database or re-export imported records. Deletion propagation and competing edit
+resolution remain outside this version. The authoritative transport, lifecycle,
+settings and authentication contract is [DSH-PEER-NETWORK.md](DSH-PEER-NETWORK.md).
 
 ## Verification boundaries
 

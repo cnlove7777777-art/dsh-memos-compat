@@ -153,6 +153,21 @@ afterEach(async () => {
 });
 
 describe("MemoryCore façade", () => {
+  it("reuses the active query embedder for peer replicas without writing traces", async () => {
+    const embedder = fakeEmbedder({ dimensions: TEST_EMBED_DIMENSIONS });
+    const embedOne = vi.spyOn(embedder, "embedOne");
+    pipeline = createPipeline(buildDeps(db!, configWithLightweightMemory(false), embedder));
+    core = createMemoryCore(pipeline, resolveHome("openclaw", "/tmp/memos-mc-test"), "test");
+    await core.init(); embedOne.mockClear();
+    const signal = new AbortController().signal, deadlineAt = Date.now() + 2000;
+    const before = db!.repos.traces.count();
+    const vector = await core.embedMemoryQuery!("previous deployment", { signal, deadlineAt });
+    expect(vector.model).toBe(`${embedder.provider}/${embedder.model}`);
+    expect(vector.values).toHaveLength(TEST_EMBED_DIMENSIONS);
+    expect(embedOne).toHaveBeenCalledWith({ text: "previous deployment", role: "query" }, { signal, deadlineAt });
+    expect(db!.repos.traces.count()).toBe(before);
+    await expect(core.embedMemoryQuery!(" ")).rejects.toThrow("Invalid memory query");
+  });
   it("init + health + shutdown lifecycle", async () => {
     pipeline = createPipeline(buildDeps(db!));
     core = createMemoryCore(

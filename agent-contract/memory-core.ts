@@ -529,6 +529,8 @@ export interface MemoryCore {
   patchConfig(patch: Record<string, unknown>): Promise<Record<string, unknown>>;
   /** Execute the active embedder, without writing memory records. */
   probeEmbedding(): Promise<{ ok: true; dimensions: number; latencyMs: number }>;
+  /** In-process peer replica retrieval reuses the active query embedder. */
+  embedMemoryQuery?(text: string, options?: { signal?: AbortSignal; deadlineAt?: number }): Promise<{ model: string; values: number[] }>;
 
   // ── optional Hub runtime hooks (HTTP viewer uses these when present) ──
   hubAdminSnapshot?(): Promise<unknown>;

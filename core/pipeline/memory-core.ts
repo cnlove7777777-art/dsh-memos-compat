@@ -4811,6 +4811,18 @@ export function createMemoryCore(
     return { ok: true, dimensions: vector.length, latencyMs: Date.now() - started };
   }
 
+  async function embedMemoryQuery(text: string, options?: { signal?: AbortSignal; deadlineAt?: number }) {
+    ensureLive();
+    if (typeof text !== "string" || !text.trim() || text.length > 2000) throw new MemosError("invalid_argument", "Invalid memory query");
+    if (!handle.embedder) throw new MemosError("embedding_unavailable", "The active embedding model is unavailable");
+    const vector = await handle.embedder.embedOne({ text, role: "query" }, options);
+    const values = Array.from(vector);
+    if (!values.length || values.length !== handle.embedder.dimensions || !values.every(Number.isFinite)) {
+      throw new MemosError("verification_failed", "The active embedding model returned an invalid query vector");
+    }
+    return { model: `${handle.embedder.provider}/${handle.embedder.model}`, values };
+  }
+
   async function ensureEmbeddingDimensionKnown(): Promise<void> {
     if (!handle.embedder || handle.embedder.dimensions > 0) return;
     try {
@@ -5289,6 +5301,7 @@ export function createMemoryCore(
     getConfig,
     patchConfig,
     probeEmbedding,
+    embedMemoryQuery,
     metrics,
     exportBundle,
     importBundle,

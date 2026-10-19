@@ -4,7 +4,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { MemoryCore } from "../../agent-contract/memory-core.js";
 import type { RetrievalQueryDTO, RetrievalResultDTO } from "../../agent-contract/dto.js";
 import { DshRemoteMemory, readPeerToken, type MemoryRemoteConfig } from "./remote.js";
-import { PEER_PROTOCOL, PEER_PORT, MAX_PEER_BYTES, PeerReplayGuard, isPrivateAddress, handshakeProof } from "./peer-protocol.js";
+import { PEER_PROTOCOL, PEER_PORT, MAX_PEER_BYTES, PeerReplayGuard, isPrivateAddress, handshakeProof, peerResponseProof } from "./peer-protocol.js";
 import type { PeerSyncStore } from "./peer-sync.js";
 
 export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
@@ -43,8 +43,15 @@ export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
   } });
 }
 
+const responseAuth = new WeakMap<ServerResponse, { key: string; nonce: string; nodeId: string }>();
 function json(res: ServerResponse, status: number, value: unknown) {
   const bytes = JSON.stringify(value);
+  if (Buffer.byteLength(bytes) > MAX_PEER_BYTES) { res.writeHead(502); res.end(); return; }
+  const auth = responseAuth.get(res);
+  if (auth) {
+    res.setHeader("X-Memory-Node", auth.nodeId);
+    res.setHeader("X-Memory-Response-Signature", peerResponseProof(auth.key, auth.nonce, auth.nodeId, status, bytes));
+  }
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(bytes);
 }
@@ -95,6 +102,7 @@ export function createMemoryPeerHandler(options: {
       }
       const body = text ? JSON.parse(text) as Record<string, unknown> : {};
       const nodeId = options.remote?.nodeId() || options.nodeId || "local-dsh";
+      if (signedNode) responseAuth.set(res, { key: token, nonce: req.headers["x-memory-nonce"] as string, nodeId });
       if (req.method === "GET" && url.pathname === "/peer/health") {
         json(res, 200, { protocol: PEER_PROTOCOL, node_id: nodeId, engine: { ok: true }, database_sync: !!config.syncEnabled }); return;
       }
@@ -102,8 +110,9 @@ export function createMemoryPeerHandler(options: {
         if (!signedNode || body.nodeId !== signedNode || typeof body.challenge !== "string" || !/^[a-f0-9]{48}$/.test(body.challenge)) {
           json(res, 400, { error: "Invalid handshake" }); return;
         }
-        await options.remote?.acceptPeer(signedNode);
+        await options.remote?.acceptPeer(signedNode, body.profile_id);
         json(res, 200, { protocol: PEER_PROTOCOL, node_id: nodeId, peer_port: config.peerPort ?? PEER_PORT,
+          profile_id: options.profileId,
           proof: handshakeProof(token, body.challenge, nodeId), database_sync: !!config.syncEnabled,
           capabilities: ["search", "detail", "relay", ...(config.syncEnabled ? ["sync"] : [])] }); return;
       }
@@ -114,11 +123,12 @@ export function createMemoryPeerHandler(options: {
         if (url.pathname === "/peer/relay/results") { options.remote.relay.results(signedNode, body.results); json(res, 200, { ok: true }); return; }
         const store = options.sync?.();
         if (!config.syncEnabled || !store) { json(res, 403, { error: "Synchronization disabled" }); return; }
+        if (!options.remote.expectedProfileId()) { json(res, 409, { error: "Complete the peer handshake first" }); return; }
         if (url.pathname === "/peer/sync/pull") {
           json(res, 200, await store.exportPage({ cursor: typeof body.cursor === "string" ? body.cursor : undefined,
             limit: typeof body.limit === "number" ? Math.min(50, Math.max(1, body.limit)) : 20 })); return;
         }
-        await store.importPage(body as unknown as Parameters<PeerSyncStore["importPage"]>[0], signedNode);
+        await store.importPage(body as unknown as Parameters<PeerSyncStore["importPage"]>[0], signedNode, options.remote.expectedProfileId());
         json(res, 200, { ok: true }); return;
       }
       const signal = AbortSignal.timeout(2_500);

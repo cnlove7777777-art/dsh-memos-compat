@@ -300,13 +300,16 @@ export async function apply(
       namespace: { agentKind: DEEPSEEK_HARNESS_AGENT, profileId: config.profileId }, query,
       topK: { tier1: 3, tier2: 5, tier3: 2 }, deadlineAt: Date.now() + 2_500, llmFilterMalformedRetries: 0 },
       { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(2_500)]) : AbortSignal.timeout(2_500), foreground: true });
-    remote = new DshRemoteMemory({ config: () => history!.config.remote, localPort: config.viewerPort, home: home.root,
+    remote = new DshRemoteMemory({ config: () => history!.config.remote, localPort: config.viewerPort, home: home.root, profileId: config.profileId,
       localSearch, localDetail: id => localCore.getTrace(id),
+      embedQuery: (query, signal, deadlineAt) => localCore.embedMemoryQuery!(query, { signal, deadlineAt }),
       peerHandler: (req, res) => memoryAccess.peer(req, res) });
     const refreshSync = async () => {
       await syncStore?.close(); syncStore = undefined; remote!.setSync(undefined);
       if (history!.config.remote.enabled && history!.config.remote.syncEnabled) {
-        syncStore = new PeerSyncStore({ home: home.root, dbPath: home.dbFile, nodeId: remote!.nodeId() });
+        const embedding = (await localCore.health()).embedder;
+        syncStore = new PeerSyncStore({ home: home.root, dbPath: home.dbFile, nodeId: remote!.nodeId(), profileId: config.profileId,
+          ...(embedding.available ? { embeddingModel: `${embedding.provider}/${embedding.model}` } : {}) });
         await syncStore.open(); remote!.setSync(syncStore);
       }
     };

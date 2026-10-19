@@ -49,8 +49,9 @@ export function parseHistoryConfig(value: unknown): HistoryConfig {
   if (!r || typeof r.enabled !== "boolean" || typeof r.url !== "string" || typeof r.tokenFile !== "string") {
     return fail("Explicit remote settings are required");
   }
+  let remoteUrl = r.url.trim();
   if (r.enabled) {
-    if (r.url.trim()) { try { peerBaseUrl(r.url.trim()); } catch { return fail("Use an HTTPS server URL or private LAN address"); } }
+    if (remoteUrl) { try { remoteUrl = peerBaseUrl(remoteUrl).href.replace(/\/$/, ""); } catch { return fail("Use an HTTPS server URL or private LAN address"); } }
     if (!r.url.trim() && r.lanDiscovery === false) return fail("Enable LAN discovery or enter a server URL");
     if (!r.tokenFile.trim() && !(typeof r.pairingKey === "string" && r.pairingKey.trim())) return fail("Set the peer pairing key");
   }
@@ -68,7 +69,7 @@ export function parseHistoryConfig(value: unknown): HistoryConfig {
   }
   return { enabled: v.enabled, codexRoot: v.codexRoot.trim(), dshRoot: v.dshRoot.trim(),
     recentDays: Number(v.recentDays), ...(backgroundModel ? { backgroundModel } : {}),
-    remote: { enabled: r.enabled, url: r.url.trim().replace(/\/$/, ""), tokenFile: r.tokenFile.trim(),
+    remote: { enabled: r.enabled, url: remoteUrl.replace(/\/$/, ""), tokenFile: r.tokenFile.trim(),
       lanDiscovery: r.lanDiscovery !== false, peerPort: Number(r.peerPort ?? 18802),
       pollIntervalSeconds: Number(r.pollIntervalSeconds ?? 30), syncEnabled: r.syncEnabled === true,
       ...(typeof r.nodeId === "string" && r.nodeId ? { nodeId: r.nodeId } : {}),
@@ -123,7 +124,15 @@ export class DshHistoryWorker implements HistoryApi {
     try {
       const saved = JSON.parse(await fs.readFile(join(this.options.home, "dsh-history.json"), "utf8"));
       if (saved.version !== 1) throw new Error("version");
+      // The old ports were SSH loopback forwards, never discoverable peers.
+      if (/^http:\/\/(127\.0\.0\.1|localhost):1879[34]\/?$/.test(saved.config?.remote?.url || "")) {
+        saved.config.remote.url = ""; saved.config.remote.lanDiscovery = true;
+      }
       this.config = parseHistoryConfig(saved.config);
+      if (this.config.remote.enabled && this.config.remote.tokenFile !== join(this.options.home, ".peer-credentials.json")) {
+        await this.storePeerCredentials(this.config, {});
+        await atomicHistoryJson(join(this.options.home, "dsh-history.json"), { version: 1, config: this.config });
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.status.lastError = "History settings could not be read; save to repair";
     }
@@ -168,20 +177,7 @@ export class DshHistoryWorker implements HistoryApi {
     const pending = this.writes.catch(() => undefined).then(async () => {
       if (this.stopped) throw new Error("History worker stopped");
       if (config.backgroundModel) await this.options.validateModel({ mode: "fixed", ...config.backgroundModel });
-      const rawRemote = (value as { remote: Record<string, unknown> }).remote;
-      const pairingKey = typeof rawRemote.pairingKey === "string" ? rawRemote.pairingKey.trim() : "";
-      const session = typeof rawRemote.session === "string" ? rawRemote.session.trim() : "";
-      if (pairingKey && (pairingKey.length < 32 || pairingKey.length > 512 || /\s/.test(pairingKey))) return fail("Use a pairing key of 32 to 512 characters without spaces");
-      if (session && (session.length > 4096 || /\s/.test(session))) return fail("Invalid server login session");
-      if (pairingKey || session) {
-        let token: string | undefined, previousSession: string | undefined;
-        try { token = JSON.parse(await fs.readFile(config.remote.tokenFile, "utf8")).token; } catch { /* A new key may be supplied. */ }
-        try { previousSession = JSON.parse(await fs.readFile(config.remote.sessionFile || "", "utf8")).session; } catch { /* First remote login. */ }
-        const credentialFile = join(this.options.home, ".peer-credentials.json");
-        await atomicHistoryJson(credentialFile, { token: pairingKey || token, session: session || previousSession });
-        config.remote.tokenFile = credentialFile;
-        if (session || previousSession) config.remote.sessionFile = credentialFile;
-      }
+      await this.storePeerCredentials(config, (value as { remote: Record<string, unknown> }).remote);
       this.priorityPaths = undefined;
       this.controller?.abort();
       await this.pending;
@@ -195,6 +191,21 @@ export class DshHistoryWorker implements HistoryApi {
     });
     this.writes = pending;
     return pending;
+  }
+  private async storePeerCredentials(config: HistoryConfig, raw: Record<string, unknown>) {
+    const pairingKey = typeof raw.pairingKey === "string" ? raw.pairingKey.trim() : "";
+    const session = typeof raw.session === "string" ? raw.session.trim() : "";
+    if (pairingKey && (pairingKey.length < 32 || pairingKey.length > 512 || /\s/.test(pairingKey))) return fail("Use a pairing key of 32 to 512 characters without spaces");
+    if (session && (session.length > 256 || /\s/.test(session))) return fail("Invalid server login session");
+    if (!config.remote.enabled && !pairingKey && !session) return;
+    let token: string | undefined, previousSession: string | undefined;
+    try { token = JSON.parse(await fs.readFile(config.remote.tokenFile, "utf8")).token; } catch { /* A new key may be supplied. */ }
+    try { previousSession = JSON.parse(await fs.readFile(config.remote.sessionFile || "", "utf8")).session; } catch { /* First remote login. */ }
+    if (!pairingKey && !session && !token) return;
+    const credentialFile = join(this.options.home, ".peer-credentials.json");
+    await atomicHistoryJson(credentialFile, { token: pairingKey || token, session: session || previousSession });
+    config.remote.tokenFile = credentialFile;
+    if (session || previousSession) config.remote.sessionFile = credentialFile;
   }
   /** Return promptly to Settings; maintenance never holds a host request open. */
   async run(value?: unknown) {

@@ -19,7 +19,7 @@ export function isPrivateAddress(input: string): boolean {
 
 export function peerBaseUrl(input: string): URL {
   let url: URL;
-  try { url = new URL(input); } catch { throw new Error("Invalid peer URL"); }
+  try { url = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`); } catch { throw new Error("Invalid peer URL"); }
   if (url.username || url.password || url.search || url.hash ||
     !(url.protocol === "https:" || url.protocol === "http:" &&
       (isPrivateAddress(url.hostname) || url.hostname === "localhost")) ||
@@ -32,7 +32,8 @@ export function peerBaseUrl(input: string): URL {
 export function peerUrl(base: string, route: string): URL {
   const url = peerBaseUrl(base);
   const prefix = url.pathname.replace(/\/$/, "");
-  url.pathname = (prefix && prefix !== "/peer" ? prefix : "/peer") + route.slice(5).split("?")[0];
+  const mount = prefix || (url.protocol === "https:" ? "/desktop/api/memory-peer" : "/peer");
+  url.pathname = mount + route.slice(5).split("?")[0];
   url.search = route.includes("?") ? route.slice(route.indexOf("?")) : "";
   return url;
 }
@@ -78,7 +79,12 @@ export function handshakeProof(key: string, challenge: string, nodeId: string): 
   return createHmac("sha256", key).update(`${PEER_PROTOCOL}\n${challenge}\n${nodeId}`).digest("hex");
 }
 
-export async function readPeerJson(response: Response): Promise<unknown> {
+export function peerResponseProof(key: string, nonce: string, nodeId: string, status: number, body: string): string {
+  return createHmac("sha256", key).update([PEER_PROTOCOL, nonce, nodeId, String(status),
+    createHash("sha256").update(body).digest("hex")].join("\n")).digest("hex");
+}
+
+export async function readPeerJson(response: Response, proof?: { key: string; nonce: string; expectedNode?: string }): Promise<unknown> {
   if (Number(response.headers.get("content-length") || 0) > MAX_PEER_BYTES) {
     await response.body?.cancel(); throw new Error("Peer response is too large");
   }
@@ -92,5 +98,14 @@ export async function readPeerJson(response: Response): Promise<unknown> {
       parts.push(Buffer.from(value));
     }
   } finally { reader.releaseLock(); }
-  return JSON.parse(Buffer.concat(parts).toString("utf8"));
+  const text = Buffer.concat(parts).toString("utf8");
+  if (proof) {
+    const node = response.headers.get("X-Memory-Node"), supplied = response.headers.get("X-Memory-Response-Signature");
+    if (!validNodeId(node) || proof.expectedNode && proof.expectedNode !== node ||
+      !supplied || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied, "hex"),
+      Buffer.from(peerResponseProof(proof.key, proof.nonce, node, response.status, text), "hex"))) {
+      throw new Error("Peer response authentication failed");
+    }
+  }
+  return JSON.parse(text);
 }

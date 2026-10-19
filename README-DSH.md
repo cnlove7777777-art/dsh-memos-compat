@@ -160,14 +160,15 @@ Reconnect MCP or start a new Codex session to discover `memory_search` and
 launch a second memory process. The credential is local setup data, never part
 of the package or repository. See [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
-Optionally enable one explicit remote peer URL (HTTPS, or loopback through SSH)
-and select its existing JSON credential file. The supported peer protocol uses
-`/peer/search`, `/peer/detail` and `/peer/health`, not an arbitrary Viewer URL.
-Local and remote recall run independently within the DSH foreground deadline;
-remote failure leaves local recall available. Results identify the remote
-source. Peer access is read-only: raw Codex sessions and SQLite files are not
-copied, merged or uploaded. A server with DSH only needs remote recall enabled;
-leave its history roots empty and history maintenance disabled.
+In `2.0.16-dsh.6`, enable peer memory in the same Settings section. Pair both
+devices with the same key, enable LAN discovery and optionally configure an
+HTTPS server URL plus its WebOS login session. LAN routes take priority; the
+desktop's outbound connection also carries reverse queries through NAT. The
+plugin never launches SSH. Optional logical synchronization keeps source-owned
+memory and vector replicas for offline recall without replacing local databases
+or uploading raw session archives. A DSH-only server needs no Codex reader.
+See the [peer transport contract](docs/DSH-PEER-NETWORK.md) for authentication,
+settings, synchronization and live acceptance boundaries.
 
 An optional existing SSH settings file (`identity`, `known_hosts`,
 `last_address`, optional `username`) lets the plugin own the paired transport.

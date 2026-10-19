@@ -204,6 +204,37 @@ async function worker(options: {
 }
 
 describe("DshHistoryWorker synthetic lifecycle", () => {
+  it("stores pairing and login secrets privately and never returns them in settings", async () => {
+    const home = await tempHome(), cfg = config(home);
+    const run = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [] });
+    const pairingKey = "synthetic-new-pairing-key-abcdefghijklmnopqrstuvwxyz", session = "synthetic-session-secret";
+    const snapshot = await run.worker.save({ ...cfg.value, enabled: false, remote: { enabled: true,
+      url: "https://example.test/desktop/api/memory-peer", tokenFile: "", pairingKey, session, syncEnabled: true } });
+    const serialized = JSON.stringify(snapshot);
+    expect(serialized).not.toContain(pairingKey); expect(serialized).not.toContain(session);
+    expect(snapshot.config.remote).toMatchObject({ hasPairingKey: true, hasSession: true, syncEnabled: true });
+    const publicConfig = await readFile(join(home, "dsh-history.json"), "utf8");
+    expect(publicConfig).not.toContain(pairingKey); expect(publicConfig).not.toContain(session);
+    expect(JSON.parse(await readFile(join(home, ".peer-credentials.json"), "utf8"))).toEqual({ token: pairingKey, session });
+    await run.worker.save(snapshot.config);
+    expect(JSON.parse(await readFile(join(home, ".peer-credentials.json"), "utf8"))).toEqual({ token: pairingKey, session });
+    await run.worker.stop();
+  });
+  it("migrates an old SSH address and market-owned key into plugin-owned LAN settings", async () => {
+    const home = await tempHome(), cfg = config(home), tokenFile = join(home, "old-market-key.json");
+    const original = JSON.stringify({ token: "synthetic-existing-pairing-key-abcdefghijklmnopqrstuvwxyz" });
+    await writeFile(tokenFile, original);
+    await writeFile(join(home, "dsh-history.json"), JSON.stringify({ version: 1, config: { ...cfg.value, enabled: false,
+      remote: { enabled: true, url: "http://127.0.0.1:18794", tokenFile, tunnelFile: "old-ssh.json" } } }));
+    const run = await worker({ home, codexRoot: cfg.codexRoot, dshRoot: cfg.dshRoot, turns: [] });
+    await run.worker.load();
+    expect(run.worker.config.remote).toMatchObject({ enabled: true, url: "", lanDiscovery: true,
+      tokenFile: join(home, ".peer-credentials.json") });
+    expect(run.worker.config.remote).not.toHaveProperty("tunnelFile");
+    expect(await readFile(tokenFile, "utf8")).toBe(original);
+    expect(await readFile(join(home, "dsh-history.json"), "utf8")).not.toContain("18794");
+    await run.worker.stop();
+  });
   it("preserves full source references across a restart independently of short tags", async () => {
     const home = await tempHome(); const cfg = config(home);
     const path = await historyFile(cfg.codexRoot, "rollout-synthetic.jsonl");

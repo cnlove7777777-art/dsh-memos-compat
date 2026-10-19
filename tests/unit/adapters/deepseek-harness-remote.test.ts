@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DshRemoteMemory, readPeerToken } from "../../../adapters/deepseek-harness/remote.js";
 import { createMemoryPeerHandler } from "../../../adapters/deepseek-harness/shared-memory.js";
-import { PeerReplayGuard, signPeerRequest, peerUrl, peerBaseUrl, handshakeProof, PEER_PROTOCOL } from "../../../adapters/deepseek-harness/peer-protocol.js";
+import { PeerReplayGuard, signPeerRequest, peerUrl, peerBaseUrl, handshakeProof, peerResponseProof, PEER_PROTOCOL } from "../../../adapters/deepseek-harness/peer-protocol.js";
 import { PeerRelay } from "../../../adapters/deepseek-harness/peer-relay.js";
 import type { MemoryCore } from "../../../agent-contract/memory-core.js";
 import type { MemoryRemoteConfig } from "../../../adapters/deepseek-harness/remote.js";
@@ -17,6 +17,11 @@ const trace = { id: "tr-real", episodeId: "ep-real", sessionId: "session-real", 
   userText: "user", agentText: "answer", toolCalls: [], value: .5, alpha: .5, priority: .5, turnId: 1 };
 const result = { query, hits: [{ tier: 2, refKind: "trace", refId: trace.id, score: .9, snippet: "previous project memory" }],
   injectedContext: "previous project memory", tierLatencyMs: { tier1: 0, tier2: 1, tier3: 0 } };
+function signedResponse(init: RequestInit, value: unknown, node = "server") {
+  const body = JSON.stringify(value), nonce = new Headers(init.headers).get("X-Memory-Nonce")!;
+  return new Response(body, { headers: { "Content-Type": "application/json", "X-Memory-Node": node,
+    "X-Memory-Response-Signature": peerResponseProof(key, nonce, node, 200, body) } });
+}
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 async function home() {
   const path = await mkdtemp(join(tmpdir(), "memos-network-")); cleanups.push(() => rm(path, { recursive: true, force: true }));
@@ -49,6 +54,7 @@ describe("peer protocol and credential boundaries", () => {
   it("retains a public gateway path and rejects public cleartext or credential URLs", () => {
     expect(peerUrl("https://example.test/desktop/api/memory-peer", "/peer/sync/pull").href)
       .toBe("https://example.test/desktop/api/memory-peer/sync/pull");
+    expect(peerUrl("example.test", "/peer/handshake").href).toBe("https://example.test/desktop/api/memory-peer/handshake");
     expect(peerUrl("http://192.168.76.1:18802", "/peer/detail").pathname).toBe("/peer/detail");
     for (const url of ["http://example.test", "https://user:secret@example.test", "https://example.test/?session=secret", "https://example.test/arbitrary"]) {
       expect(() => peerBaseUrl(url)).toThrow();
@@ -74,7 +80,7 @@ describe("peer protocol and credential boundaries", () => {
       const headers = init.headers;
       expect(headers.Authorization).toBeUndefined(); expect(headers["X-WebOS-Session"]).toBeUndefined();
       expect(headers["X-Memory-Signature"]).toMatch(/^[a-f0-9]{64}$/);
-      return Response.json(result);
+      return signedResponse(init, result);
     });
     const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,
       url: "http://192.168.76.1:18802", tokenFile, sessionFile: tokenFile, nodeId: "desktop" }), fetch: fetchMock as never });
@@ -85,7 +91,7 @@ describe("peer protocol and credential boundaries", () => {
       expect(String(url)).toBe("https://example.test/desktop/api/memory-peer/search");
       expect(init.headers.Authorization).toBe(`Bearer ${key}`);
       expect(init.headers["X-WebOS-Session"]).toBe("synthetic-webos-session"); expect(init.redirect).toBe("error");
-      return Response.json(result);
+      return signedResponse(init, result);
     });
     const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,
       url: "https://example.test/desktop/api/memory-peer", tokenFile, sessionFile: tokenFile }), fetch: fetchMock as never });
@@ -100,9 +106,36 @@ describe("peer protocol and credential boundaries", () => {
     const cancelled = new DshRemoteMemory({ localPort: 18801, config });
     await expect(cancelled.search(query, controller.signal)).rejects.toThrow();
   });
+  it("rejects a response altered after the authenticated request", async () => {
+    const { tokenFile } = await home();
+    const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,
+      url: "http://192.168.76.1:18802", tokenFile }), fetch: vi.fn(async (_url, init) => {
+        const signed = signedResponse(init, result);
+        return new Response(JSON.stringify({ ...result, injectedContext: "forged history" }), { headers: signed.headers });
+      }) as never });
+    await expect(client.search(query)).rejects.toThrow("Peer response authentication failed");
+  });
 });
 
 describe("real HTTP peer routes", () => {
+  it("prefers discovered LAN and falls back to the configured gateway when LAN fails", async () => {
+    const peer = await paired(); const { tokenFile } = await home(); let failLan = false;
+    const calls: string[] = [];
+    const client = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true, tokenFile,
+      url: "https://gateway.test/desktop/api/memory-peer", nodeId: "desktop", expectedNodeId: "server" }),
+      discoveryFactory: options => ({ start: async () => { options.onPeer({ nodeId: "server", url: peer.endpoint.url, lastSeenAt: Date.now() }); },
+        stop: async () => {}, scan: async () => {} }),
+      fetch: async (target, init) => {
+        const url = new URL(String(target)); calls.push(url.origin);
+        if (url.origin === peer.endpoint.url && failLan) throw new Error("LAN disconnected");
+        if (url.hostname === "gateway.test") return fetch(peer.endpoint.url + url.pathname.replace("/desktop/api/memory-peer", "/peer"), init);
+        return fetch(target, init);
+      } });
+    cleanups.push(() => client.stop()); await client.start(); await client.connect();
+    expect(client.snapshot().route).toBe("lan");
+    failLan = true; expect((await client.search(query)).hits[0].refId).toBe("remote~tr-real");
+    expect(client.snapshot().route).toBe("wan"); expect(calls).toContain("https://gateway.test");
+  });
   it("mutually handshakes, remembers identity and queries only the peer local core", async () => {
     const { desktop, searchMemory, getTrace } = await paired();
     expect(desktop.snapshot()).toMatchObject({ state: "connected", nodeId: "server" });

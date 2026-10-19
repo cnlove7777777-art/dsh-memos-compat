@@ -16,6 +16,8 @@ import { startHttpServer } from "../../../server/index.js";
 import type { ServerHandle } from "../../../server/index.js";
 import type { MemoryCore } from "../../../agent-contract/memory-core.js";
 
+function slashPath(value: string): string { return value.replace(/\\/g, "/"); }
+
 function stubCore(): MemoryCore {
   return {
     init: vi.fn(async () => {}),
@@ -821,7 +823,7 @@ describe("HTTP server — REST routes", () => {
         path: string;
       };
       expect(scanBody).toMatchObject({ found: true, total: 2, files: 1, sessions: 1 });
-      expect(scanBody.path).toMatch(/\.openclaw\/agents$/);
+      expect(slashPath(scanBody.path)).toMatch(/\.openclaw\/agents$/);
 
       const run = await fetch(`${local.url}/api/v1/import/openclaw-native/run`, {
         method: "POST",
@@ -940,7 +942,7 @@ describe("HTTP server — REST routes", () => {
     // button. The path is hard-coded to the openclaw layout.
     expect(typeof body.found).toBe("boolean");
     expect(body.agent).toBe("openclaw");
-    if (body.path) expect(body.path).toMatch(/\.openclaw\/memos-local\/memos\.db$/);
+    if (body.path) expect(slashPath(body.path)).toMatch(/\.openclaw\/memos-local\/memos\.db$/);
   });
 
   it("POST /api/v1/migrate/openclaw/run returns { imported: {...} } even when empty", async () => {
@@ -963,7 +965,7 @@ describe("HTTP server — REST routes", () => {
       expect(body.error).toBeDefined();
       // 404 must mention the openclaw legacy path so the user knows
       // which file we tried to read.
-      expect(body.error?.message ?? "").toMatch(/\.openclaw\//);
+      expect(slashPath(body.error?.message ?? "")).toMatch(/\.openclaw\//);
     }
   });
 
@@ -975,7 +977,7 @@ describe("HTTP server — REST routes", () => {
     // The hermes legacy plugin nested its data under
     // `~/.hermes/memos-state/memos-local/memos.db` (not the openclaw
     // layout). This test is what would have caught the original bug.
-    if (body.path) expect(body.path).toMatch(/\.hermes\/memos-state\/memos-local\/memos\.db$/);
+    if (body.path) expect(slashPath(body.path)).toMatch(/\.hermes\/memos-state\/memos-local\/memos\.db$/);
   });
 
   it("POST /api/v1/migrate/hermes/run targets the hermes legacy path", async () => {
@@ -992,9 +994,9 @@ describe("HTTP server — REST routes", () => {
     };
     if (r.status === 200) {
       expect(body.agent).toBe("hermes");
-      expect(body.path ?? "").toMatch(/\.hermes\/memos-state\/memos-local\/memos\.db$/);
+      expect(slashPath(body.path ?? "")).toMatch(/\.hermes\/memos-state\/memos-local\/memos\.db$/);
     } else {
-      expect(body.error?.message ?? "").toMatch(/\.hermes\/memos-state\//);
+      expect(slashPath(body.error?.message ?? "")).toMatch(/\.hermes\/memos-state\//);
     }
   });
 
@@ -1014,7 +1016,7 @@ describe("HTTP server — REST routes", () => {
       expect(r.status).toBe(200);
       const body = (await r.json()) as { found: boolean; path?: string; agent?: string };
       expect(body.agent).toBe("hermes");
-      if (body.path) expect(body.path).toMatch(/\.hermes\/memos-state\/memos-local\/memos\.db$/);
+      if (body.path) expect(slashPath(body.path)).toMatch(/\.hermes\/memos-state\/memos-local\/memos\.db$/);
     } finally {
       await local.close();
     }
