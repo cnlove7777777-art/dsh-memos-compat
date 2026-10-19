@@ -363,6 +363,15 @@ describe("PeerSyncStore", () => {
     expect(new Set([...first.items, ...second.items].map((item) => item.id)).size)
       .toBe(first.items.length + second.items.length);
 
+    const repeated: string[] = []; let repeatCursor = second.nextCursor;
+    for (let i = 0; i < 8; i++) {
+      const page = pageOf(store, { cursor: repeatCursor, limit: 1 });
+      repeated.push(...page.items.map(item => item.id)); repeatCursor = page.nextCursor;
+      if (page.done) break;
+    }
+    expect(repeated).toHaveLength(5);
+    expect(new Set(repeated).size).toBe(5);
+
     f.repos.traces.updateScore("trace-1", { value: 0.9, alpha: 0.8, priority: 1 });
     let sweepCursor = second.nextCursor;
     let sawUpdatedTrace = false;
@@ -526,7 +535,28 @@ describe("PeerSyncStore", () => {
       originNode: "node-b",
       refId: "replica~node-b~trace-b",
     });
-    expect(store.getTrace("trace-1", "node-b")).toMatchObject({ originNode: "node-a" });
+    expect(store.getTrace("trace-1", "node-b")).toBeNull();
+  });
+
+  it("persists, updates and removes the remote vector index independently of local matches", () => {
+    const f = fixture(); seedTrace(f); const store = openStore(f);
+    const exported = store.exportPage(); const trace = exported.items.find(item => item.kind === "trace")!;
+    const page: PeerSyncPage = { ...exported, nodeId: "node-b", items: [{ ...trace, id: "trace-b",
+      payload: { ...trace.payload, summary: "Remote project fact" }, vectors: [trace.vectors[0]] }] };
+    expect(store.importPage(page, "node-b", "default").inserted).toBe(1);
+    expect(store.stats().vectors).toBe(1);
+    const search = () => store.search("absent-lexical-token", 10, { model: EMBEDDING, values: [1, 0, 0] }, { replicasOnly: true });
+    expect(search()).toMatchObject([{ refId: "replica~node-b~trace-b", vectorScore: 1, origin: "replica" }]);
+    store.close(); store.open(); expect(search()).toHaveLength(1);
+    expect(store.importPage(page, "node-b", "default").skipped).toBe(1);
+    expect(store.stats().vectors).toBe(1);
+    const changed = { ...page, items: [{ ...page.items[0], revision: "changed", vectors: [{ ...trace.vectors[0], values: [0, 1, 0] }] }] };
+    expect(store.importPage(changed, "node-b", "default").updated).toBe(1);
+    expect(search()).toEqual([]);
+    store.importPage({ ...changed, items: [{ ...changed.items[0], revision: "without-vector", vectors: [] }] }, "node-b", "default");
+    expect(store.stats().vectors).toBe(0);
+    expect(() => store.importPage({ ...page, items: [{ ...page.items[0], vectors: [{ ...trace.vectors[0], values: [1e300, 0, 0] }] }] }, "node-b", "default")).toThrow(/finite/i);
+    expect(() => store.importPage({ ...page, profileId: "different", items: [{ ...page.items[0], payload: { ...page.items[0].payload, ownerProfileId: "different" } }] }, "node-b", "different")).toThrow(/profile changed/i);
   });
 
   it("skips absent source tables safely and enforces bounded page sizes", () => {

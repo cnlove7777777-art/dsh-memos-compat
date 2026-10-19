@@ -359,7 +359,7 @@ export class PeerSyncStore {
       items,
       done: !hasMore,
     };
-    if (!hasMore && keys.length > 0) {
+    if (!hasMore) {
       const rev = (cursor?.rev ?? 0) + 1;
       page.nextCursor = encodeCursor({ version: 2, rev });
     } else if (last) {
@@ -378,6 +378,9 @@ export class PeerSyncStore {
   ): { inserted: number; updated: number; skipped: number } {
     const replica = this.requireReplica();
     const validated = validatePage(page, expectedNodeId, this.options.nodeId, expectedSourceProfileId);
+    const remembered = replica.prepare("SELECT source_profile_id FROM peer_items WHERE profile_id = ? AND origin_node = ? LIMIT 1")
+      .get([this.profileId, validated.originNode]) as { source_profile_id: string } | undefined;
+    if (remembered && remembered.source_profile_id !== validated.sourceProfileId) throw new TypeError("Peer node source profile changed");
     const upsert = replica.prepare(`
       INSERT INTO peer_items (
         profile_id, origin_node, source_profile_id, kind, id, revision, payload_json, vectors_json,
@@ -399,6 +402,11 @@ export class PeerSyncStore {
       "SELECT revision FROM peer_items WHERE profile_id = ? AND origin_node = ? AND source_profile_id = ? AND kind = ? AND id = ?",
     );
     const result = { inserted: 0, updated: 0, skipped: 0 };
+    const removeVectors = replica.prepare("DELETE FROM peer_vectors WHERE profile_id = ? AND origin_node = ? AND kind = ? AND item_id = ?");
+    const countVectors = replica.prepare("SELECT COUNT(*) AS n FROM peer_vectors WHERE profile_id = ? AND origin_node = ? AND kind = ? AND item_id = ?");
+    const insertVector = replica.prepare(`INSERT INTO peer_vectors
+      (profile_id, origin_node, kind, item_id, slot, model, dimension, values_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
     replica.tx(() => {
       for (const item of validated.items) {
         const previous = exists.get([
@@ -424,6 +432,13 @@ export class PeerSyncStore {
           source_updated_at: item.sourceUpdatedAt,
           imported_at: Date.now(),
         });
+        const vectorKey = [this.profileId, validated.originNode, item.kind, item.id];
+        const indexed = countVectors.get(vectorKey) as { n: number };
+        if (run.changes > 0 || Number(indexed.n) !== item.vectors.length) {
+          removeVectors.run(vectorKey);
+          for (const vector of item.vectors) insertVector.run([...vectorKey,
+            vector.slot, vector.model, vector.dimension, JSON.stringify(vector.values)]);
+        }
         if (!previous) result.inserted++;
         else if (run.changes > 0) result.updated++;
         else result.skipped++;
@@ -432,7 +447,7 @@ export class PeerSyncStore {
     return result;
   }
 
-  search(query: string, limit = 10, queryVector?: PeerSearchVector): PeerRetrievalHit[] {
+  search(query: string, limit = 10, queryVector?: PeerSearchVector, options?: { replicasOnly?: boolean }): PeerRetrievalHit[] {
     this.requireReplica();
     const text = query.trim().slice(0, 2_000);
     if (!text) return [];
@@ -443,8 +458,8 @@ export class PeerSyncStore {
       }
     }
     const bounded = clampLimit(limit);
-    const lexical = this.lexical(text, Math.max(20, bounded * 4));
-    const vector = queryVector ? this.vectorSearch(queryVector, Math.max(20, bounded * 4)) : [];
+    const lexical = this.lexical(text, Math.max(20, bounded * 4), options?.replicasOnly);
+    const vector = queryVector ? this.vectorSearch(queryVector, Math.max(20, bounded * 4), options?.replicasOnly) : [];
     const merged = new Map<string, PeerRetrievalHit>();
     for (const hit of lexical) merged.set(hit.refId, hit);
     for (const hit of vector) {
@@ -470,8 +485,7 @@ export class PeerSyncStore {
       return this.getReplicaTrace(rest.slice(split + 1), rest.slice(0, split));
     }
     if (nodeId && nodeId !== this.options.nodeId) {
-      const replicaTrace = this.getReplicaTrace(id, nodeId);
-      if (replicaTrace) return replicaTrace;
+      return this.getReplicaTrace(id, nodeId);
     }
     if (!this.sourceTables.has("traces")) return null;
     const profile = this.profilePredicate(source, "traces");
@@ -536,11 +550,11 @@ export class PeerSyncStore {
     };
   }
 
-  private lexical(query: string, limit: number): PeerRetrievalHit[] {
+  private lexical(query: string, limit: number, replicasOnly = false): PeerRetrievalHit[] {
     const source = this.requireSource();
     const replica = this.requireReplica();
     const hits: PeerRetrievalHit[] = [];
-    for (const spec of TABLE_SPECS) {
+    for (const spec of replicasOnly ? [] : TABLE_SPECS) {
       if (this.sourceTables.has(spec.table)) {
         const profile = this.profilePredicate(source, spec.table);
         for (const row of source
@@ -566,7 +580,7 @@ export class PeerSyncStore {
     return hits.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
-  private vectorSearch(query: PeerSearchVector, limit: number): PeerRetrievalHit[] {
+  private vectorSearch(query: PeerSearchVector, limit: number, replicasOnly = false): PeerRetrievalHit[] {
     const queryModel = normalizeEmbeddingModel(query.model);
     if (!queryModel || query.values.length === 0) return [];
     if (!this.embeddingModel || queryModel !== this.embeddingModel) {
@@ -576,7 +590,7 @@ export class PeerSyncStore {
     const source = this.requireSource();
     const replica = this.requireReplica();
     const hits: PeerRetrievalHit[] = [];
-    for (const spec of TABLE_SPECS) {
+    for (const spec of replicasOnly ? [] : TABLE_SPECS) {
       if (!this.sourceTables.has(spec.table)) continue;
       const profile = this.profilePredicate(source, spec.table);
       for (const row of source
@@ -696,7 +710,7 @@ export class PeerSyncStore {
       id,
       episodeId: safeString(source.episode_id, 512) || safeString(payload.episodeId, 512),
       sessionId: safeString(source.session_id, 512) || safeString(payload.sessionId, 512),
-      ownerAgentKind: safeString(source.owner_agent_kind, 128) || "unknown",
+      ownerAgentKind: safeString(source.owner_agent_kind ?? payload.ownerAgentKind, 128) || "unknown",
       ownerProfileId: safeString(source.owner_profile_id, 128) || "default",
       ownerWorkspaceId: safeString(source.owner_workspace_id, 256) || null,
       ts: safeInteger(source.ts) ?? safeInteger(payload.ts) ?? 0,
@@ -814,7 +828,7 @@ export class PeerSyncStore {
     // request deliberately starts a fresh full-table pass so rows whose
     // timestamp never advances (notably value/alpha updates on traces) are
     // still compared by content revision.
-    let active = !cursor || cursor.rev !== undefined;
+    let active = !cursor || !cursor.kind;
     for (const spec of TABLE_SPECS) {
       if (!this.sourceTables.has(spec.table)) continue;
       const started = !cursor || active || spec.kind === cursor.kind;
@@ -940,7 +954,7 @@ function validatePage(
     if (typeof ownerProfileId !== "string" || normalizeProfileId(ownerProfileId) !== sourceProfileId) {
       throw new TypeError("Peer item profile does not match the page");
     }
-    if (typeof ownerAgentKind !== "string" || !ownerAgentKind.trim()) {
+    if (ownerAgentKind !== "deepseek-harness") {
       throw new TypeError("Peer item agent identity is missing");
     }
     const vectors = sanitizeVectors(item.vectors as unknown[]);
@@ -1248,7 +1262,7 @@ function safeNumber(value: unknown): number {
 }
 
 function isFiniteFloat(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
+  return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 3.4028234663852886e38;
 }
 
 function isKind(value: unknown): value is PeerSyncKind {
@@ -1332,7 +1346,7 @@ function readConfiguredEmbeddingModel(home: string, dataDir: string): string | u
     if (!embedding) return undefined;
     const provider = typeof embedding.provider === "string" ? embedding.provider.trim() : "";
     const model = typeof embedding.model === "string" ? embedding.model.trim() : "";
-    if (!provider || !model || embedding.dimensions !== undefined) return undefined;
+    if (!provider || !model) return undefined;
     return normalizeEmbeddingModel(provider && model ? `${provider}/${model}` : undefined);
     } catch {
       return undefined;
@@ -1351,7 +1365,7 @@ function migrateLegacyReplicaSchema(db: StorageDb): void {
     !ftsColumns.has("profile_id") ||
     itemColumns.has("source_profile_id")
   ) return;
-  const schemaVersion = Number(db.prepare("PRAGMA user_version").get() as unknown);
+  const schemaVersion = Number((db.prepare("PRAGMA user_version").get() as { user_version?: number })?.user_version ?? 0);
   if (schemaVersion === 1) throw new Error("PeerSync replica belongs to another profile");
   db.exec(`
     DROP TRIGGER IF EXISTS peer_items_ai;
