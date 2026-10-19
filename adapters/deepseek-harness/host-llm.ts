@@ -24,6 +24,10 @@ import type {
   HostLlmCompletion,
 } from "../../core/llm/host-bridge.js";
 import type { LlmMessage, LlmUsage } from "../../core/llm/types.js";
+import {
+  activityErrorCode,
+  type DshActivityLedger,
+} from "./activity.js";
 
 const HOST_LLM_BRIDGE_ID = "deepseek-harness.host.v1";
 const HOST_LLM_TIMEOUT_CODE = "MEMOS_DSH_HOST_LLM_TIMEOUT";
@@ -112,6 +116,9 @@ export interface CreateDeepSeekHarnessHostLlmBridgeOptions {
   /** Memory-specific selection; absent means follow the owning conversation. */
   readonly resolveRoute?: () => DeepSeekHarnessLlmRoute | undefined;
   readonly isEnabled?: () => boolean;
+  readonly activity?: DshActivityLedger;
+  /** Stable call-site label; no prompt text is recorded. */
+  readonly activityOperation?: string;
 }
 
 /**
@@ -145,6 +152,8 @@ export function createDeepSeekHarnessHostLlmBridge(
       }
 
       const startedAt = Date.now();
+      let requestStarted = false;
+      let activity: ReturnType<DshActivityLedger["beginModel"]> | undefined;
       const callDeadline = deadline(
         input.signal,
         input.timeoutMs ?? 0,
@@ -163,12 +172,18 @@ export function createDeepSeekHarnessHostLlmBridge(
         const request = createGenerateOptions(input, route, prepared.config);
         request.signal = callDeadline.signal;
         const assembler = new BlockAssembler();
+        activity = options.activity?.beginModel({
+          operation: options.activityOperation || "memory.text",
+          provider: route.provider,
+          model: route.model,
+          at: startedAt,
+        });
+        requestStarted = true;
         for await (const chunk of prepared.stream(request)) {
           callDeadline.signal.throwIfAborted();
           assembler.push(chunk);
         }
         callDeadline.signal.throwIfAborted();
-
         assertSuccessfulFinish(assembler.finish);
         const blocks = assembler.blocks();
         if (blocks.some((block) => block.type === "tool-call")) {
@@ -197,6 +212,7 @@ export function createDeepSeekHarnessHostLlmBridge(
           );
         }
 
+        activity?.finish({ outcome: "success" });
         return {
           text,
           model: route.model,
@@ -204,6 +220,10 @@ export function createDeepSeekHarnessHostLlmBridge(
           durationMs: Date.now() - startedAt,
         };
       } catch (error) {
+        if (requestStarted) activity?.finish({
+          outcome: "failure",
+          errorCode: activityErrorCode(error, "model_request_failed"),
+        });
         const timeout = timeoutOf(callDeadline.signal, HOST_LLM_TIMEOUT_CODE);
         if (timeout) {
           throw new MemosError(

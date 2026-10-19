@@ -115,8 +115,12 @@ describe("DSH memory model settings", () => {
     registerMemorySettingsHttp({ inject: (_deps, apply) => apply({
       connection: { fetch: { register } }, effect: effect => { releases.push(effect()); },
     }) }, f.settings);
-    expect(register).toHaveBeenCalledTimes(6);
+    expect(register).toHaveBeenCalledTimes(7);
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ path: "/api/memos/history/connect", methods: ["POST"] }));
-    releases.forEach(release => release()); expect(dispose).toHaveBeenCalledTimes(6);
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({
+      path: "/api/memos/activity",
+      methods: ["GET"],
+    }));
+    releases.forEach(release => release()); expect(dispose).toHaveBeenCalledTimes(7);
   });
 });

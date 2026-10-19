@@ -1,7 +1,7 @@
 import type { MemorySettingsApi } from "./settings.js";
 import { MemosError } from "../../agent-contract/errors.js";
 
-export const DSH_MEMORY_PATHS = ["/api/memos/settings", "/api/memos/test", "/api/memos/embedding-test", "/api/memos/history", "/api/memos/history-run", "/api/memos/history/connect"];
+export const DSH_MEMORY_PATHS = ["/api/memos/settings", "/api/memos/test", "/api/memos/embedding-test", "/api/memos/history", "/api/memos/history-run", "/api/memos/history/connect", "/api/memos/activity"];
 
 export async function handleMemorySettingsRequest(api: MemorySettingsApi, request: Request): Promise<Response> {
   const url = new URL(request.url);
@@ -11,6 +11,8 @@ export async function handleMemorySettingsRequest(api: MemorySettingsApi, reques
   });
   try {
     if ((action === "history" || action === "history-run" || action === "connect") && !api.history) return respond(404, { error: { message: "History worker unavailable" } });
+    if (action === "activity" && !api.activity) return respond(404, { error: { message: "Activity ledger unavailable" } });
+    if (action === "activity" && request.method === "GET") return respond(200, await api.activity!());
     if (action === "connect" && request.method === "POST") return respond(200, await api.history!.connect?.());
     if (action === "history" && request.method === "GET") return respond(200, await api.history!.snapshot());
     if (action === "history" && request.method === "PUT") return respond(200, await api.history!.save(await request.json()));
@@ -50,8 +52,14 @@ export interface SettingsConnectionContext {
 export function registerMemorySettingsHttp(ctx: SettingsConnectionContext, api: MemorySettingsApi): void {
   ctx.inject(["connection"], child => {
     for (const path of DSH_MEMORY_PATHS) child.effect(() => child.connection.fetch.register({
-      path, methods: /\/(settings|history)$/.test(path) ? ["GET", "PUT"] : ["POST"],
+      path, methods: memorySettingsMethods(path),
       requestBody: "buffered", fetch: request => handleMemorySettingsRequest(api, request),
     }), `memos: ${path}`);
   });
+}
+
+export function memorySettingsMethods(path: string): string[] {
+  if (/\/(settings|history)$/.test(path)) return ["GET", "PUT"];
+  if (path.endsWith("/activity")) return ["GET"];
+  return ["POST"];
 }

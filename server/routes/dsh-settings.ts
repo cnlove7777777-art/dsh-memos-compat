@@ -1,14 +1,14 @@
 import type { ServerDeps } from "../types.js";
 import type { Routes } from "./registry.js";
 import { writeJson } from "../middleware/io.js";
-import { DSH_MEMORY_PATHS, handleMemorySettingsRequest } from "../../adapters/deepseek-harness/settings-http.js";
+import { DSH_MEMORY_PATHS, handleMemorySettingsRequest, memorySettingsMethods } from "../../adapters/deepseek-harness/settings-http.js";
 
 export function registerDshSettingsRoutes(routes: Routes, deps: ServerDeps): void {
   if (!deps.dshSettings) return;
   const api = deps.dshSettings;
   for (const path of DSH_MEMORY_PATHS) {
     const viewerPath = path.replace("/api/memos/", "/api/v1/dsh/");
-    const methods = /\/(settings|history)$/.test(path) ? ["GET", "PUT"] : ["POST"];
+    const methods = memorySettingsMethods(path);
     for (const method of methods) routes.set(`${method} ${viewerPath}`, async ctx => {
       const origin = ctx.req.headers.origin;
       const authority = ctx.req.headers.host;

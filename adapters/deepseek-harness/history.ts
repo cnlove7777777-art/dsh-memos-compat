@@ -11,6 +11,7 @@ import { HistoryInputLimitError, readHistoryFile, type HistoryTurn } from "./his
 import type { DeepSeekHarnessLlmRoute } from "./host-llm.js";
 import type { MemoryRemoteConfig } from "./remote.js";
 import { peerBaseUrl, validNodeId } from "./peer-protocol.js";
+import { type DshActivityLedger } from "./activity.js";
 
 export interface HistoryConfig {
   enabled: boolean;
@@ -124,6 +125,7 @@ export class DshHistoryWorker implements HistoryApi {
     changed?: () => Promise<void>;
     remoteStatus?: () => unknown;
     connectRemote?: () => Promise<unknown>;
+    activity?: DshActivityLedger;
     reader?: typeof readHistoryFile;
     maxTurns?: number;
   }) { this.config = defaultHistoryConfig(); }
@@ -182,7 +184,8 @@ export class DshHistoryWorker implements HistoryApi {
     const config = structuredClone(this.config);
     config.remote.hasPairingKey = !!config.remote.tokenFile;
     config.remote.hasSession = !!config.remote.sessionFile;
-    return { config, status: { ...this.status }, mcp: this.options.mcp(), remote: this.options.remoteStatus?.() };
+    return { config, status: { ...this.status }, mcp: this.options.mcp(), remote: this.options.remoteStatus?.(),
+      ...(this.options.activity ? { activity: await this.options.activity.snapshot() } : {}) };
   }
   async connect() { await this.options.connectRemote?.(); return this.snapshot(); }
   async save(value: unknown) {
@@ -370,6 +373,13 @@ export class DshHistoryWorker implements HistoryApi {
           toolCalls: [], value: 0, alpha: 0, priority: 0.5,
         }] });
         if (!imported.imported && !await this.options.core.getTrace(id)) throw new Error("History import failed");
+        if (imported.imported) this.options.activity?.recordSummary({
+          source: turn.source,
+          provider: route.provider,
+          model: route.model,
+          summary,
+          at: Date.now(),
+        });
         this.status.imported += imported.imported;
       }
       this.phase = "checkpoint";

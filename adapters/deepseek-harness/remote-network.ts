@@ -10,6 +10,12 @@ import { PEER_PROTOCOL, PEER_PORT, peerBaseUrl, peerUrl, signPeerRequest, handsh
 import { normalizeHit, normalizeTrace, normalizeLatency, deadlineFor, isJsonObject } from "./remote-normalize.js";
 import type { PeerSyncStore } from "./peer-sync.js";
 import { createPeerFetch, peerFetchFailure } from "./peer-fetch.js";
+import {
+  activityErrorCode,
+  type ActivityRoute,
+  type DshActivityLedger,
+} from "./activity.js";
+import type { PeerSyncPage } from "./peer-sync.js";
 
 export interface MemoryRemoteConfig {
   enabled: boolean; url: string; tokenFile: string;
@@ -36,6 +42,7 @@ export interface DshRemoteMemoryOptions {
   sync?: PeerSyncStore;
   discoveryFactory?: (options: PeerDiscoveryOptions) => Pick<PeerDiscovery, "start" | "stop" | "scan">;
   embedQuery?: (query: string, signal?: AbortSignal, deadlineAt?: number) => Promise<{ model: string; values: number[] }>;
+  activity?: DshActivityLedger;
 }
 export async function readPeerToken(path: string, reader: typeof readFile = readFile): Promise<string> {
   try {
@@ -292,11 +299,58 @@ export class DshRemoteMemory {
   }
   private async synchronize(): Promise<void> {
     const store = this.options.sync, route = this.route; if (!store || !route || this.stopped) return;
-    const pulled = await this.requestAt(route.url, "/peer/sync/pull", { cursor: this.cursor, limit: 20 }, this.controller?.signal, 5000);
-    await store.importPage(pulled as Parameters<PeerSyncStore["importPage"]>[0], route.nodeId, this.expectedProfileId());
-    this.cursor = (pulled as { nextCursor?: string }).nextCursor;
+    const activityRoute: ActivityRoute = route.kind;
+    let pulled: PeerSyncPage | undefined;
+    try {
+      pulled = await this.requestAt(route.url, "/peer/sync/pull", { cursor: this.cursor, limit: 20 }, this.controller?.signal, 5000) as PeerSyncPage;
+      const received = await store.importPage(pulled, route.nodeId, this.expectedProfileId());
+      this.options.activity?.recordSync({
+        operation: "pull",
+        direction: "receive",
+        outcome: "success",
+        route: activityRoute,
+        peer: route.nodeId,
+        receivedItems: Array.isArray(pulled.items) ? pulled.items.length : 0,
+        inserted: received.inserted,
+        updated: received.updated,
+        skipped: received.skipped,
+      });
+      this.cursor = pulled.nextCursor;
+    } catch (error) {
+      this.options.activity?.recordSync({
+        operation: "pull",
+        direction: "receive",
+        outcome: "failure",
+        route: activityRoute,
+        peer: route.nodeId,
+        receivedItems: Array.isArray(pulled?.items) ? pulled.items.length : 0,
+        errorCode: activityErrorCode(error, "peer_sync_pull_failed"),
+      });
+      throw error;
+    }
     const push = await store.exportPage({ cursor: this.pushCursor, limit: 20 });
-    await this.requestAt(route.url, "/peer/sync/push", push, this.controller?.signal, 5000);
+    try {
+      await this.requestAt(route.url, "/peer/sync/push", push, this.controller?.signal, 5000);
+      this.options.activity?.recordSync({
+        operation: "push",
+        direction: "send",
+        outcome: "success",
+        route: activityRoute,
+        peer: route.nodeId,
+        sentItems: push.items.length,
+      });
+    } catch (error) {
+      this.options.activity?.recordSync({
+        operation: "push",
+        direction: "send",
+        outcome: "failure",
+        route: activityRoute,
+        peer: route.nodeId,
+        sentItems: push.items.length,
+        errorCode: activityErrorCode(error, "peer_sync_push_failed"),
+      });
+      throw error;
+    }
     this.pushCursor = push.nextCursor; await this.persist();
   }
   private async requestAt(base: string, route: string, value?: unknown, signal?: AbortSignal, timeout = 2800, method = "POST"): Promise<unknown> {

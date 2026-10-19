@@ -89,6 +89,79 @@ interface HistoryStatus {
   lastWarning?: string;
 }
 
+interface ActivityTotals {
+  sync: {
+    attempts: number;
+    successes: number;
+    failures: number;
+    sentItems: number;
+    receivedItems: number;
+    inserted: number;
+    updated: number;
+    skipped: number;
+    lastAttemptAt?: number;
+  };
+  model: {
+    requests: number;
+    successes: number;
+    failures: number;
+    pending: number;
+    totalDurationMs: number;
+    lastRequestAt?: number;
+  };
+  summaries: number;
+}
+
+interface ActivitySnapshot {
+  version: 1;
+  trackingSince: number;
+  totals: ActivityTotals;
+  session: ActivityTotals;
+  recentSync: Array<{
+    id: string;
+    at: number;
+    operation: "pull" | "push" | "serve_pull" | "receive_push";
+    direction: "send" | "receive";
+    outcome: "success" | "failure";
+    route: "lan" | "wan" | "relay" | "gateway";
+    peer?: string;
+    sentItems: number;
+    receivedItems: number;
+    inserted: number;
+    updated: number;
+    skipped: number;
+    errorCode?: string;
+  }>;
+  recentModels: Array<{
+    id: string;
+    at: number;
+    completedAt?: number;
+    durationMs?: number;
+    operation: string;
+    provider: string;
+    model: string;
+    outcome: "success" | "failure" | "pending" | "interrupted";
+    errorCode?: string;
+  }>;
+  recentSummaries: Array<{
+    id: string;
+    at: number;
+    source: "codex" | "dsh";
+    provider: string;
+    model: string;
+    summary: string;
+  }>;
+  persistence: {
+    status: "ready" | "degraded";
+    warning?: string;
+  };
+  definition: {
+    modelRequest: string;
+    syncCounts: string;
+    providerRetries: string;
+  };
+}
+
 interface HistoryMcp {
   url?: string;
   enabled: boolean;
@@ -99,6 +172,7 @@ interface HistorySnapshot {
   status: HistoryStatus;
   mcp: HistoryMcp;
   remote?: HistoryRemoteStatus;
+  activity?: ActivitySnapshot;
 }
 
 interface HistoryRemoteStatus {
@@ -684,6 +758,175 @@ function syncCount(sync: unknown): number | undefined {
     if (typeof value === "number" && Number.isFinite(value) && value > 0) total += value;
   }
   return total;
+}
+
+function ActivityHistoryCard({ activity }: { activity: ActivitySnapshot | undefined }) {
+  if (activity === undefined) return null;
+  const total = activity.totals;
+  const session = activity.session;
+  const averageMs = total.model.successes > 0
+    ? Math.round(total.model.totalDurationMs / total.model.successes)
+    : undefined;
+  return (
+    <div className="memos-settings-readonly">
+      <div className="memos-settings-card-head">
+        <div>
+          <h3 className="memos-settings-card-title">活动记录</h3>
+          <p className="memos-settings-muted">
+            从 {formatTimestamp(activity.trackingSince)} 开始记录；以下累计仅统计本设备。
+          </p>
+        </div>
+        <span
+          className="memos-settings-chip"
+          data-tone={activity.persistence.status === "ready" ? "good" : "bad"}
+        >
+          {activity.persistence.status === "ready" ? "记录已保存" : "记录保存异常"}
+        </span>
+      </div>
+      <div className="memos-settings-embedding-grid">
+        <div className="memos-settings-metric">
+          <span className="memos-settings-metric-label">同步尝试</span>
+          <span className="memos-settings-metric-value">
+            本次 {session.sync.attempts} · 本设备累计 {total.sync.attempts}
+          </span>
+          <span className="memos-settings-muted">
+            成功 {total.sync.successes} · 失败 {total.sync.failures}
+          </span>
+        </div>
+        <div className="memos-settings-metric">
+          <span className="memos-settings-metric-label">同步收发</span>
+          <span className="memos-settings-metric-value">
+            已发送 {session.sync.sentItems} · 已接收 {session.sync.receivedItems}
+          </span>
+          <span className="memos-settings-muted">
+            累计已发送 {total.sync.sentItems} · 已接收 {total.sync.receivedItems}
+          </span>
+        </div>
+        <div className="memos-settings-metric">
+          <span className="memos-settings-metric-label">文字模型请求</span>
+          <span className="memos-settings-metric-value">
+            本次 {session.model.requests} · 本设备累计 {total.model.requests}
+          </span>
+          <span className="memos-settings-muted">
+            成功 {total.model.successes} · 失败 {total.model.failures}
+            {total.model.pending > 0 ? ` · 进行中 ${total.model.pending}` : ""}
+          </span>
+        </div>
+        <div className="memos-settings-metric">
+          <span className="memos-settings-metric-label">平均成功耗时</span>
+          <span className="memos-settings-metric-value">
+            {averageMs === undefined ? "—" : formatDuration(averageMs)}
+          </span>
+          <span className="memos-settings-muted">模型服务内部的重试不单独计数</span>
+        </div>
+      </div>
+      <details className="memos-settings-details">
+        <summary>最近同步（{activity.recentSync.length}）</summary>
+        {activity.recentSync.length === 0 ? (
+          <p className="memos-settings-muted">尚无同步记录。</p>
+        ) : (
+          activity.recentSync.slice().reverse().map(row => (
+            <div key={row.id} className="memos-settings-readonly">
+              <span className="memos-settings-route">
+                {activitySyncLabel(row.operation)} · {formatTimestamp(row.at)} · {activityRouteLabel(row.route)}
+                {row.peer ? ` · ${row.peer}` : ""}
+              </span>
+              <span className="memos-settings-muted">
+                {row.outcome === "success" ? "成功" : `失败 ${row.errorCode ?? ""}`}
+                {` · 发送 ${row.sentItems} · 接收 ${row.receivedItems} · 新增 ${row.inserted} · 更新 ${row.updated} · 未变 ${row.skipped}`}
+              </span>
+            </div>
+          ))
+        )}
+      </details>
+      <details className="memos-settings-details">
+        <summary>最近文字模型请求（{activity.recentModels.length}）</summary>
+        {activity.recentModels.length === 0 ? (
+          <p className="memos-settings-muted">尚无模型请求记录。</p>
+        ) : (
+          activity.recentModels.slice().reverse().map(row => (
+            <div key={row.id} className="memos-settings-readonly">
+              <span className="memos-settings-route">
+                {row.provider}/{row.model} · {formatTimestamp(row.at)}
+              </span>
+              <span className="memos-settings-muted">
+                {activityModelOperationLabel(row.operation)} · {
+                  row.outcome === "success"
+                    ? `${formatDuration(row.durationMs)}`
+                    : activityModelOutcomeLabel(row.outcome)
+                }
+                {row.errorCode ? ` · ${row.errorCode}` : ""}
+              </span>
+            </div>
+          ))
+        )}
+      </details>
+      <details className="memos-settings-details">
+        <summary>最近历史整理摘要（本设备累计 {total.summaries}）</summary>
+        {activity.recentSummaries.length === 0 ? (
+          <p className="memos-settings-muted">尚无成功生成并写入记忆库的摘要。</p>
+        ) : (
+          activity.recentSummaries.slice().reverse().map(row => (
+            <div key={row.id} className="memos-settings-readonly">
+              <span className="memos-settings-route">
+                {row.source === "codex" ? "Codex" : "DSH"} · {row.provider}/{row.model} · {formatTimestamp(row.at)}
+              </span>
+              <span className="memos-settings-muted">{row.summary}</span>
+            </div>
+          ))
+        )}
+      </details>
+      <p className="memos-settings-note">
+        统计记忆插件发起的文字模型请求，模型服务内部的重试不单独计数。
+        每次收发同步页分别计数；发送记录以本机成功处理为准。
+        仅保留简短摘要，不保存完整对话或登录凭据。向量模型状态单独显示。
+      </p>
+      {activity.persistence.warning && (
+        <p className="memos-settings-message" data-tone="warn">
+          部分活动记录未能保存，请检查存储状态。错误代码：{activity.persistence.warning}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function activitySyncLabel(value: ActivitySnapshot["recentSync"][number]["operation"]): string {
+  return {
+    pull: "向对端拉取",
+    push: "向对端发送",
+    serve_pull: "本机向对端提供",
+    receive_push: "本机接收对端发送",
+  }[value];
+}
+
+function activityRouteLabel(value: ActivitySnapshot["recentSync"][number]["route"]): string {
+  return {
+    lan: "局域网直连",
+    wan: "公网 HTTPS",
+    relay: "反向中继",
+    gateway: "认证网关",
+  }[value];
+}
+
+function activityModelOperationLabel(value: string): string {
+  return {
+    "memory.core_text": "记忆文字模型",
+    "history.refine": "历史整理",
+    "settings.model_test": "模型连接测试",
+  }[value] || value;
+}
+
+function activityModelOutcomeLabel(value: string): string {
+  return {
+    failure: "失败",
+    pending: "进行中",
+    interrupted: "重启时中断",
+  }[value] || value;
+}
+
+function formatDuration(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return "—";
+  return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s`;
 }
 
 function remoteConnectionMessage(remote: HistoryRemoteStatus | undefined): string {
@@ -1396,6 +1639,7 @@ function HistorySettingsCard({
         <p className="memos-settings-message" data-tone="warn">{status.lastError}</p>
       )}
       {status.lastWarning && <p className="memos-settings-message" data-tone="warn">{status.lastWarning}</p>}
+      <ActivityHistoryCard activity={history.activity} />
 
       {error !== "" && (
         <p className="memos-settings-message" data-tone="error" role="alert">{error}</p>

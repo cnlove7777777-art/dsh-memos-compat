@@ -10,6 +10,7 @@ import type {
   DeepSeekHarnessLlmRouteContext, DeepSeekHarnessHostLlmBridge,
 } from "./host-llm.js";
 import { createDeepSeekHarnessHostLlmBridge } from "./host-llm.js";
+import type { DshActivityLedger } from "./activity.js";
 
 export type MemoryModelSelection = { mode: "follow" } | {
   mode: "fixed"; provider: string; model: string;
@@ -22,6 +23,7 @@ export interface DshModelRegistry extends DeepSeekHarnessLlmLike {
 
 export interface MemorySettingsApi {
   history?: import("./history.js").HistoryApi;
+  activity?(): Promise<import("./activity.js").DshActivitySnapshot>;
   snapshot(): Promise<unknown>;
   save(value: unknown): Promise<unknown>;
   test(value: unknown, signal?: AbortSignal): Promise<unknown>;
@@ -55,6 +57,7 @@ export class DshMemorySettings implements MemorySettingsApi {
   private writes: Promise<unknown> = Promise.resolve();
   private readonly path: string;
   private warning?: string;
+  private activityLedger?: DshActivityLedger;
   constructor(private readonly options: {
     home: string; enabled: boolean; llm: DshModelRegistry;
     routes: DeepSeekHarnessLlmRouteContext; core: () => MemoryCore;
@@ -81,6 +84,14 @@ export class DshMemorySettings implements MemorySettingsApi {
 
   isEnabled(): boolean { return this.enabled; }
   configurationWarning(): string | undefined { return this.warning; }
+  setActivity(ledger: DshActivityLedger): void { this.activityLedger = ledger; }
+  async activity(): Promise<import("./activity.js").DshActivitySnapshot> {
+    if (!this.activityLedger) throw new MemosError(
+      "not_initialized",
+      "Memory activity ledger is unavailable",
+    );
+    return this.activityLedger.snapshot();
+  }
 
   route(): DeepSeekHarnessLlmRoute | undefined {
     if (!this.enabled) throw new MemosError(ERROR_CODES.LLM_UNAVAILABLE,
@@ -149,7 +160,9 @@ export class DshMemorySettings implements MemorySettingsApi {
       route = candidate;
     }
     await this.validate({ mode: "fixed", provider: route.provider, model: route.model });
-    const probeBridge = createDeepSeekHarnessHostLlmBridge({ llm: this.options.llm, routes: this.options.routes });
+    const probeBridge = createDeepSeekHarnessHostLlmBridge({ llm: this.options.llm,
+      routes: this.options.routes, activity: this.activityLedger,
+      activityOperation: "settings.model_test" });
     // Test an unsaved candidate without replacing the live memory selection.
     const result = await this.options.routes.run(route, () => probeBridge.complete({
       messages: [{ role: "user", content: "Reply with the single word OK." }],

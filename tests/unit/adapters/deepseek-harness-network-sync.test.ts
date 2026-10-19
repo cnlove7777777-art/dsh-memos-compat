@@ -7,6 +7,7 @@ import { PeerSyncStore } from "../../../adapters/deepseek-harness/peer-sync.js";
 import { DshRemoteMemory, type MemoryRemoteConfig } from "../../../adapters/deepseek-harness/remote.js";
 import { createMemoryPeerHandler } from "../../../adapters/deepseek-harness/shared-memory.js";
 import type { MemoryCore } from "../../../agent-contract/memory-core.js";
+import { DshActivityLedger } from "../../../adapters/deepseek-harness/activity.js";
 
 const cleanups: Array<() => unknown> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -29,11 +30,17 @@ it("synchronizes different DSH profiles bidirectionally and recalls a persisted 
   await writeFile(credential, JSON.stringify({ token: "synthetic-network-sync-pairing-key-abcdefghijklmnopqrstuvwxyz" }));
   const desktopStore = new PeerSyncStore({ home: desktopDb.dir, dbPath: desktopDb.filepath, nodeId: "desktop", profileId: "desktop", embeddingModel: model });
   const serverStore = new PeerSyncStore({ home: serverDb.dir, dbPath: serverDb.filepath, nodeId: "server", profileId: "nanopi", embeddingModel: model });
+  const desktopActivity = new DshActivityLedger(desktopDb.dir);
+  const serverActivity = new DshActivityLedger(serverDb.dir);
+  await desktopActivity.load();
+  await serverActivity.load();
   desktopStore.open(); serverStore.open(); cleanups.push(() => desktopStore.close()); cleanups.push(() => serverStore.close());
   const serverConfig: MemoryRemoteConfig = { enabled: true, tokenFile: credential, url: "", lanDiscovery: false, syncEnabled: true, nodeId: "server", expectedNodeId: "desktop" };
-  const server = new DshRemoteMemory({ config: () => serverConfig, localPort: 18801, profileId: "nanopi", sync: serverStore });
+  const server = new DshRemoteMemory({ config: () => serverConfig, localPort: 18801, profileId: "nanopi", sync: serverStore,
+    activity: serverActivity });
   cleanups.push(() => server.stop());
-  const handler = createMemoryPeerHandler({ core: {} as MemoryCore, config: () => serverConfig, profileId: "nanopi", remote: server, sync: () => serverStore });
+  const handler = createMemoryPeerHandler({ core: {} as MemoryCore, config: () => serverConfig, profileId: "nanopi", remote: server,
+    sync: () => serverStore, activity: serverActivity });
   const userAgents: Array<string | undefined> = [];
   const listener = createServer((req, res) => { userAgents.push(req.headers["user-agent"]); void handler(req, res); });
   await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
@@ -42,11 +49,21 @@ it("synchronizes different DSH profiles bidirectionally and recalls a persisted 
   const config: MemoryRemoteConfig = { enabled: true, tokenFile: credential, url: `http://127.0.0.1:${(listener.address() as { port: number }).port}`,
     lanDiscovery: false, syncEnabled: true, nodeId: "desktop", expectedNodeId: "server" };
   const desktop = new DshRemoteMemory({ config: () => config, localPort: 18801, profileId: "desktop", sync: desktopStore,
-    embedQuery: async () => ({ model, values: [1, 0, 0] }) });
+    embedQuery: async () => ({ model, values: [1, 0, 0] }), activity: desktopActivity });
   cleanups.push(() => desktop.stop()); await server.start(); await desktop.start(); await desktop.connect();
   expect(userAgents.length).toBeGreaterThan(0);
   expect(userAgents.every(value => value === "MemOS-DSH/2")).toBe(true);
   expect(desktop.snapshot()).toMatchObject({ state: "connected", sync: { replicas: { trace: 1 }, vectors: 1 } });
+  const desktopActivitySnapshot = await desktopActivity.snapshot();
+  const serverActivitySnapshot = await serverActivity.snapshot();
+  expect(desktopActivitySnapshot.recentSync).toEqual(expect.arrayContaining([
+    expect.objectContaining({ operation: "pull", route: "lan", receivedItems: 1, inserted: 1 }),
+    expect.objectContaining({ operation: "push", route: "lan", sentItems: 1 }),
+  ]));
+  expect(serverActivitySnapshot.recentSync).toEqual(expect.arrayContaining([
+    expect.objectContaining({ operation: "serve_pull", route: "lan", sentItems: 1 }),
+    expect.objectContaining({ operation: "receive_push", route: "lan", receivedItems: 1, inserted: 1 }),
+  ]));
   expect(serverStore.stats()).toMatchObject({ replicas: { trace: 1 }, vectors: 1, sourceProfiles: ["desktop"] });
   expect(desktopStore.stats().sourceProfiles).toEqual(["nanopi"]);
   expect(desktopDb.repos.traces.count()).toBe(1); expect(serverDb.repos.traces.count()).toBe(1);

@@ -47,6 +47,7 @@ import { DshRemoteMemory } from "./remote.js";
 import { createMemoryMcpHandler } from "./mcp.js";
 import { createMemoryPeerHandler, federateMemoryCore } from "./shared-memory.js";
 import { PeerSyncStore } from "./peer-sync.js";
+import { DshActivityLedger } from "./activity.js";
 
 export const name = DEEPSEEK_HARNESS_PLUGIN;
 export const inject = ["systemPrompt", "tools", "llm"];
@@ -244,6 +245,7 @@ export async function apply(
   let history: DshHistoryWorker | undefined;
   let remote: DshRemoteMemory | undefined;
   let syncStore: PeerSyncStore | undefined;
+  let activity: DshActivityLedger | undefined;
   let disposing = false;
   const registrations: Array<() => void> = [];
   const unregisterAll = (): void => {
@@ -262,14 +264,18 @@ export async function apply(
       ctx.logger.warn(`memos-local-memory: ${warning}`);
     }
     const memoryConfig = configureDshManagedModels(loaded.config);
+    activity = new DshActivityLedger(home.root);
+    await activity.load();
     const routes = new DeepSeekHarnessLlmRouteContext();
     const settings = new DshMemorySettings({ home: home.root, enabled: config.hostLlmEnabled,
       llm: ctx.llm as DshModelRegistry, routes, core: () => core!,
       viewerUrl: () => viewer?.url });
+    settings.setActivity(activity);
     await settings.load();
     if (settings.configurationWarning()) ctx.logger.warn(`memos-local-memory: ${settings.configurationWarning()}`);
     const hostLlmBridge = createDeepSeekHarnessHostLlmBridge({
       llm: ctx.llm, routes, resolveRoute: () => settings.route(), isEnabled: () => settings.isEnabled(),
+      activity, activityOperation: "memory.core_text",
     });
     if (hostLlmBridge) {
       registrations.push(registerDeepSeekHarnessHostLlmCapabilityInvalidation(
@@ -295,7 +301,8 @@ export async function apply(
     await core.init();
     const localCore = core;
     const backgroundBridge = createDeepSeekHarnessHostLlmBridge({ llm: ctx.llm, routes,
-      isEnabled: () => settings.isEnabled() });
+      isEnabled: () => settings.isEnabled(), activity,
+      activityOperation: "history.refine" });
     const localSearch = (query: string, signal?: AbortSignal) => localCore.searchMemory({ agent: DEEPSEEK_HARNESS_AGENT,
       namespace: { agentKind: DEEPSEEK_HARNESS_AGENT, profileId: config.profileId }, query,
       topK: { tier1: 3, tier2: 5, tier3: 2 }, deadlineAt: Date.now() + 2_500, llmFilterMalformedRetries: 0 },
@@ -303,7 +310,7 @@ export async function apply(
     remote = new DshRemoteMemory({ config: () => history!.config.remote, localPort: config.viewerPort, home: home.root, profileId: config.profileId,
       localSearch, localDetail: id => localCore.getTrace(id),
       embedQuery: (query, signal, deadlineAt) => localCore.embedMemoryQuery!(query, { signal, deadlineAt }),
-      peerHandler: (req, res) => memoryAccess.peer(req, res) });
+      peerHandler: (req, res) => memoryAccess.peer(req, res), activity });
     const refreshSync = async () => {
       await syncStore?.close(); syncStore = undefined; remote!.setSync(undefined);
       if (history!.config.remote.enabled && history!.config.remote.syncEnabled) {
@@ -320,6 +327,7 @@ export async function apply(
       mcp: () => ({ enabled: !!viewer, url: viewer ? `${viewer.url}/mcp` : undefined }),
       remoteStatus: () => remote!.snapshot(), connectRemote: () => remote!.connect(),
       changed: async () => { await remote!.stop(); await remote!.initialize(); await refreshSync(); await remote!.start(); },
+      activity,
     });
     await history.load();
     await remote.initialize();
@@ -346,7 +354,7 @@ export async function apply(
         fetch: id => core!.getTrace(id),
       }),
       peer: createMemoryPeerHandler({ core: localCore, config: () => history!.config.remote, profileId: config.profileId,
-        remote, sync: () => syncStore }),
+        remote, sync: () => syncStore, activity }),
     };
     if (typeof ctx.inject === "function") registerMemorySettingsHttp(ctx as unknown as SettingsConnectionContext, settings);
 
@@ -539,6 +547,7 @@ export async function apply(
     }
     if (bridge) await bridge.dispose();
     else if (core) await core.shutdown();
+    await activity?.close().catch(() => undefined);
     const message = error instanceof Error ? error.message : String(error);
     ctx.logger.warn(`memos-local-memory: startup failed: ${message}`);
     if (config.failOnStartupError) throw error;
@@ -561,6 +570,7 @@ export async function apply(
       }
     }
     await bridge!.dispose();
+    await activity?.close().catch(() => undefined);
     ctx.logger.info("memos-local-memory: stopped");
   };
 }

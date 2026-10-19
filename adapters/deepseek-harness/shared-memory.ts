@@ -6,6 +6,10 @@ import type { RetrievalQueryDTO, RetrievalResultDTO } from "../../agent-contract
 import { DshRemoteMemory, readPeerToken, type MemoryRemoteConfig } from "./remote.js";
 import { PEER_PROTOCOL, PEER_PORT, MAX_PEER_BYTES, PeerReplayGuard, isPrivateAddress, handshakeProof, peerResponseProof } from "./peer-protocol.js";
 import type { PeerSyncStore } from "./peer-sync.js";
+import {
+  activityErrorCode,
+  type DshActivityLedger,
+} from "./activity.js";
 
 export function federateMemoryCore(core: MemoryCore, remote: DshRemoteMemory,
   config: () => MemoryRemoteConfig, sourceFor?: (id: string) => unknown): MemoryCore {
@@ -59,6 +63,7 @@ function json(res: ServerResponse, status: number, value: unknown) {
 export function createMemoryPeerHandler(options: {
   core: MemoryCore; config: () => MemoryRemoteConfig; profileId: string; nodeId?: string;
   remote?: DshRemoteMemory; sync?: () => PeerSyncStore | undefined;
+  activity?: DshActivityLedger;
 }) {
   const replay = new PeerReplayGuard();
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -124,11 +129,67 @@ export function createMemoryPeerHandler(options: {
         const store = options.sync?.();
         if (!config.syncEnabled || !store) { json(res, 403, { error: "Synchronization disabled" }); return; }
         if (!options.remote.expectedProfileId()) { json(res, 409, { error: "Complete the peer handshake first" }); return; }
+        // The WebOS gateway arrives over loopback. A direct private-LAN peer
+        // arrives on its own address and must retain the LAN route label.
+        // The public HTTPS gateway can run on the same host, so loopback alone
+        // cannot distinguish both paths; the WebOS session header is unique to
+        // that authenticated gateway.
+        const route = loopback && !!req.headers["x-webos-session"] ? "gateway" : "lan";
         if (url.pathname === "/peer/sync/pull") {
-          json(res, 200, await store.exportPage({ cursor: typeof body.cursor === "string" ? body.cursor : undefined,
-            limit: typeof body.limit === "number" ? Math.min(50, Math.max(1, body.limit)) : 20 })); return;
+          let page;
+          try {
+            page = await store.exportPage({ cursor: typeof body.cursor === "string" ? body.cursor : undefined,
+              limit: typeof body.limit === "number" ? Math.min(50, Math.max(1, body.limit)) : 20 });
+            options.activity?.recordSync({
+              operation: "serve_pull",
+              direction: "send",
+              outcome: "success",
+              route,
+              peer: signedNode,
+              sentItems: page.items.length,
+            });
+          } catch (error) {
+            options.activity?.recordSync({
+              operation: "serve_pull",
+              direction: "send",
+              outcome: "failure",
+              route,
+              peer: signedNode,
+              errorCode: activityErrorCode(error, "peer_sync_export_failed"),
+            });
+            throw error;
+          }
+          json(res, 200, page); return;
         }
-        await store.importPage(body as unknown as Parameters<PeerSyncStore["importPage"]>[0], signedNode, options.remote.expectedProfileId());
+        try {
+          const received = await store.importPage(
+            body as unknown as Parameters<PeerSyncStore["importPage"]>[0],
+            signedNode,
+            options.remote.expectedProfileId(),
+          );
+          options.activity?.recordSync({
+            operation: "receive_push",
+            direction: "receive",
+            outcome: "success",
+            route,
+            peer: signedNode,
+            receivedItems: Array.isArray(body.items) ? body.items.length : 0,
+            inserted: received.inserted,
+            updated: received.updated,
+            skipped: received.skipped,
+          });
+        } catch (error) {
+          options.activity?.recordSync({
+            operation: "receive_push",
+            direction: "receive",
+            outcome: "failure",
+            route,
+            peer: signedNode,
+            receivedItems: Array.isArray(body.items) ? body.items.length : 0,
+            errorCode: activityErrorCode(error, "peer_sync_import_failed"),
+          });
+          throw error;
+        }
         json(res, 200, { ok: true }); return;
       }
       const signal = AbortSignal.timeout(2_500);

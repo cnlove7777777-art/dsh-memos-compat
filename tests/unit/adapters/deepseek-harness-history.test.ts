@@ -9,6 +9,7 @@ import {
   type HistoryConfig,
 } from "../../../adapters/deepseek-harness/history.js";
 import { HISTORY_FILE_LIMIT, readHistoryFile, type HistoryTurn } from "../../../adapters/deepseek-harness/history-readers.js";
+import { DshActivityLedger } from "../../../adapters/deepseek-harness/activity.js";
 
 const homes: string[] = [];
 
@@ -172,6 +173,7 @@ async function worker(options: {
   const bridge = options.bridge ?? bridgeFake();
   const route = options.route ?? (() => ({ provider: "local", model: "synthetic" }));
   const reader = options.reader ?? vi.fn(async () => options.turns);
+  const activity = new DshActivityLedger(options.home);
   const value = new DshHistoryWorker({
     home: options.home,
     profileId: "synthetic-profile",
@@ -183,6 +185,7 @@ async function worker(options: {
     mcp: () => ({ enabled: false }),
     reader,
     maxTurns: options.maxTurns,
+    activity,
   });
   const workerConfig: HistoryConfig = {
     enabled: true,
@@ -201,7 +204,7 @@ async function worker(options: {
     value.config = workerConfig;
     await value.run();
   };
-  return { worker: value, config: workerConfig, core, bridge, reader, start, resume };
+  return { worker: value, config: workerConfig, core, bridge, reader, activity, start, resume };
 }
 
 describe("DshHistoryWorker synthetic lifecycle", () => {
@@ -333,6 +336,36 @@ describe("DshHistoryWorker synthetic lifecycle", () => {
     expect(second.reader).not.toHaveBeenCalled();
     expect(second.core.importBundle).not.toHaveBeenCalled();
     expect(second.bridge.complete).not.toHaveBeenCalled();
+  });
+
+  it("records a summary only after a history turn is newly imported", async () => {
+    const home = await tempHome();
+    const cfg = config(home);
+    await historyFile(cfg.codexRoot, "rollout-summary-activity.jsonl");
+    const fixture = turn(1);
+    const first = await worker({
+      home,
+      codexRoot: cfg.codexRoot,
+      dshRoot: cfg.dshRoot,
+      turns: [fixture],
+    });
+    await first.start();
+    await first.worker.waitForIdle();
+    expect((await first.activity.snapshot()).totals.summaries).toBe(1);
+    expect((await first.activity.snapshot()).recentSummaries[0]?.summary)
+      .toBe("synthetic refined memory");
+
+    const second = await worker({
+      home,
+      codexRoot: cfg.codexRoot,
+      dshRoot: cfg.dshRoot,
+      turns: [fixture],
+      core: first.core,
+    });
+    await second.activity.load();
+    await second.resume();
+    await second.worker.waitForIdle();
+    expect((await second.activity.snapshot()).totals.summaries).toBe(1);
   });
 
   it("denies an admin source outside configured roots without invoking the reader", async () => {

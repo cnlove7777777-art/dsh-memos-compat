@@ -51,12 +51,13 @@ From a DSH profile directory, the GitHub default branch can be installed with:
 dsh plugin --profile <name> add cnlove7777777-art/dsh-memos-compat
 ```
 
-For the `2.0.16-dsh.7` candidate on `feat/dsh-peer-network-20261019`, build
-and install its tarball. The GitHub default branch may contain an older version:
+Build the tarball from the current release source and install that exact
+artifact into both endpoints. Use the generated filename rather than treating
+the GitHub default branch as the release:
 
 ```sh
 npm pack
-dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.8.tgz
+dsh plugin --profile <name> add ./memtensor-memos-local-plugin-<version>.tgz
 ```
 
 DSH's plugin manager owns dependency installation and bundle registration.
@@ -192,6 +193,25 @@ deferred for five minutes while other turns continue; retry receipts survive a
 restart. Public HTTPS peers respect existing proxy and NO_PROXY settings through
 a per-client dispatcher, while LAN peers connect directly. WAN calls allow up to
 eight seconds, still respecting an earlier caller deadline or cancellation.
+
+## Activity records (`2.0.16-dsh.9`)
+
+Both DSH Settings and Viewer Settings show device totals, this-run counts,
+recent synchronization results, text-model calls and short excerpts of newly
+generated summaries. Refresh status to update the panel and expand the recent
+records for details. Counts start when this release is enabled, survive restarts
+and do not infer historical calls from existing memory rows. A synchronization
+count represents one pull or push operation; empty and repeated pages are still
+operations. Text-model counts cover requests made by this plugin through DSH,
+not all conversation calls or provider-internal retries.
+
+The local `dsh-activity.json` journal retains up to 64 sync records, 64 model
+records and 32 redacted summary excerpts of at most 280 characters, within a
+256 KiB limit. It excludes raw conversations, prompts and credentials. Read-only
+snapshots are available at DSH `/api/memos/activity` and Viewer
+`/api/v1/dsh/activity`. A journal write failure reports degraded status without
+blocking memory work. Summary excerpts appear only after generation and import
+succeed; merely receiving a peer summary does not count as local generation.
 
 ## Known limits
 

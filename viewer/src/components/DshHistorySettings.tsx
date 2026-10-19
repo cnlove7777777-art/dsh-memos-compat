@@ -7,6 +7,11 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { api, ApiError } from "../api/client";
 import { Icon } from "./Icon";
+import {
+  DshActivityPanel,
+  type DshActivitySnapshot,
+} from "./DshActivityPanel";
+import { safeActivitySnapshot } from "./dsh-activity-format";
 
 export interface DshHistoryBackgroundModel {
   provider: string;
@@ -76,6 +81,7 @@ export interface DshHistorySnapshot {
   status: DshHistoryStatus;
   mcp: DshHistoryMcp;
   remote?: DshHistoryRemoteStatus;
+  activity?: DshActivitySnapshot;
 }
 
 export interface DshHistoryModelOption {
@@ -95,6 +101,7 @@ export function DshHistorySettings({
   models: DshHistoryModelOption[];
 }) {
   const [snapshot, setSnapshot] = useState<DshHistorySnapshot | null>(null);
+  const [activity, setActivity] = useState<DshActivitySnapshot | null>(null);
   const [draft, setDraft] = useState<DshHistoryConfig | null>(null);
   const [capability, setCapability] = useState<
     "loading" | "available" | "unavailable" | "error"
@@ -113,6 +120,7 @@ export function DshHistorySettings({
       .get<DshHistorySnapshot>("/api/v1/dsh/history", { signal: ctrl.signal })
       .then((next) => {
         setSnapshot(next);
+        setActivity(safeActivitySnapshot(next.activity));
         setDraft(configDraft(next.config));
         setCapability("available");
       })
@@ -245,6 +253,8 @@ export function DshHistorySettings({
     try {
       const next = await api.get<DshHistorySnapshot>("/api/v1/dsh/history");
       setSnapshot(next);
+      const safeActivity = safeActivitySnapshot(next.activity);
+      if (safeActivity) setActivity(safeActivity);
       setDraft((previous) =>
         previous === null ||
         snapshotAtStart === null ||
@@ -782,6 +792,7 @@ export function DshHistorySettings({
           <span class="pill pill--candidate">等待记忆模型</span>
         )}
       </div>
+      <DshActivityPanel activity={activity} />
       {snapshot.status.lastError && (
         <div
           role="status"
