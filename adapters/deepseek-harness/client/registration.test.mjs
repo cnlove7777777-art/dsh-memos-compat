@@ -129,4 +129,189 @@ assert.equal(transportCalls[0].init.credentials, "same-origin");
 assert.equal(transportCalls[0].init.cache, "no-store");
 assert.equal(transportCalls[0].init.headers.get("accept"), "application/json");
 
-console.log("client registration and DSH transport harness: pass");
+const payloadStart = source.indexOf("function historyConfigDraft");
+const payloadEnd = source.indexOf("function historyModelGroups");
+assert.ok(payloadStart >= 0 && payloadEnd > payloadStart);
+const payloadSandbox = {
+  console,
+  setTimeout,
+  clearTimeout,
+  Headers,
+  Response,
+};
+payloadSandbox.globalThis = payloadSandbox;
+vm.runInNewContext(
+  [
+    "function historyModelKey(model) {",
+    "  return model === undefined ? \"__memory_route__\" : `${model.provider}\\u0000${model.model}`;",
+    "}",
+    "function clampNumber(value, fallback, min, max) {",
+    "  if (!Number.isFinite(value)) return fallback;",
+    "  return Math.min(max, Math.max(min, Math.round(value)));",
+    "}",
+    "const DEFAULT_PEER_PORT = 18802;",
+    "const DEFAULT_POLL_INTERVAL_SECONDS = 30;",
+    "function historyPeerPort(value) {",
+    "  return clampNumber(Number(value), DEFAULT_PEER_PORT, 1024, 65535);",
+    "}",
+    "function historyPollInterval(value) {",
+    "  return clampNumber(Number(value), DEFAULT_POLL_INTERVAL_SECONDS, 15, 3600);",
+    "}",
+    source.slice(payloadStart, payloadEnd),
+    "this.historyConfigDraftForTest = historyConfigDraft;",
+    "this.historyDraftAfterStatusRefreshForTest = historyDraftAfterStatusRefresh;",
+    "this.historyDraftAfterResponseForTest = historyDraftAfterResponse;",
+    "this.buildHistorySavePayloadForTest = buildHistorySavePayload;",
+    "this.sameHistoryConfigForTest = sameHistoryConfig;",
+  ].join("\n"),
+  payloadSandbox,
+  { filename: "history-payload.js" },
+);
+
+const saved = payloadSandbox.historyConfigDraftForTest({
+  config: {
+    enabled: true,
+    codexRoot: "C:\\\\sessions",
+    dshRoot: "D:\\\\sessions",
+    recentDays: 7,
+    remote: {
+      enabled: true,
+      url: "https://memory.example.com",
+      tokenFile: "C:\\\\secrets\\\\token.json",
+      tunnelFile: "C:\\\\secrets\\\\ssh.json",
+      sessionFile: " C:\\\\secrets\\\\session.json ",
+      nodeId: " nanopi-m4v2 ",
+      expectedNodeId: " windows-dsh ",
+      lanDiscovery: true,
+      peerPort: 18_802,
+      pollIntervalSeconds: 30,
+      syncEnabled: true,
+      pairingKey: "must-not-be-read",
+      session: "must-not-be-read",
+      hasPairingKey: true,
+      hasSession: true,
+    },
+  },
+  status: {
+    running: false,
+    imported: 0,
+    skipped: 0,
+    waitingForModel: false,
+  },
+  mcp: { enabled: false },
+  remote: {
+    state: "connected",
+    route: "lan",
+    nodeId: "nanopi-m4v2",
+    lastConnectedAt: Date.now(),
+    sync: { replicas: { trace: 2, policy: 1 } },
+  },
+});
+
+assert.equal(saved.remote.nodeId, " nanopi-m4v2 ");
+assert.equal(saved.remote.sessionFile, " C:\\\\secrets\\\\session.json ");
+assert.equal(saved.remote.pairingKey, undefined);
+assert.equal(saved.remote.session, undefined);
+assert.equal(saved.remote.hasPairingKey, true);
+assert.equal(saved.remote.hasSession, true);
+assert.equal(saved.remote.tunnelFile, undefined);
+assert.equal(payloadSandbox.sameHistoryConfigForTest(saved, saved), true);
+
+saved.remote.pairingKey = "new-pairing-key";
+saved.remote.session = "new-session";
+const payload = payloadSandbox.buildHistorySavePayloadForTest(saved);
+assert.deepEqual(JSON.parse(JSON.stringify(payload.remote)), {
+  enabled: true,
+  url: "https://memory.example.com",
+  tokenFile: "C:\\\\secrets\\\\token.json",
+  sessionFile: "C:\\\\secrets\\\\session.json",
+  nodeId: "nanopi-m4v2",
+  expectedNodeId: "windows-dsh",
+  lanDiscovery: true,
+  peerPort: 18_802,
+  pollIntervalSeconds: 30,
+  syncEnabled: true,
+  pairingKey: "new-pairing-key",
+  session: "new-session",
+});
+assert.equal("tunnelFile" in payload.remote, false);
+assert.equal("hasPairingKey" in payload.remote, false);
+assert.equal("hasSession" in payload.remote, false);
+
+const blankSecrets = payloadSandbox.buildHistorySavePayloadForTest({
+  ...saved,
+  remote: {
+    ...saved.remote,
+    pairingKey: "   ",
+    session: "",
+  },
+});
+assert.equal("pairingKey" in blankSecrets.remote, false);
+assert.equal("session" in blankSecrets.remote, false);
+
+const unsaved = {
+  ...saved,
+  remote: {
+    ...saved.remote,
+    nodeId: "unsaved-node",
+    pairingKey: "unsaved-secret",
+  },
+};
+assert.equal(
+  payloadSandbox.historyDraftAfterStatusRefreshForTest(unsaved, saved, {
+    config: payloadSandbox.historyConfigDraftForTest({
+      config: {
+        enabled: true,
+        codexRoot: "C:\\\\sessions",
+        dshRoot: "D:\\\\sessions",
+        recentDays: 7,
+        remote: { enabled: true, url: "https://other.example.com", tokenFile: "" },
+      },
+      status: {
+        running: true,
+        imported: 1,
+        skipped: 0,
+        waitingForModel: false,
+      },
+      mcp: { enabled: false },
+    }).config,
+    status: {
+      running: true,
+      imported: 1,
+      skipped: 0,
+      waitingForModel: false,
+    },
+    mcp: { enabled: false },
+  }),
+  unsaved,
+);
+assert.equal(
+  payloadSandbox.historyDraftAfterResponseForTest(unsaved, saved, {
+    config: payloadSandbox.historyConfigDraftForTest({
+      config: {
+        enabled: true,
+        codexRoot: "C:\\\\sessions",
+        dshRoot: "D:\\\\sessions",
+        recentDays: 7,
+        remote: { enabled: true, url: "https://other.example.com", tokenFile: "" },
+      },
+      status: {
+        running: true,
+        imported: 1,
+        skipped: 0,
+        waitingForModel: false,
+      },
+      mcp: { enabled: false },
+    }).config,
+    status: {
+      running: true,
+      imported: 1,
+      skipped: 0,
+      waitingForModel: false,
+    },
+    mcp: { enabled: false },
+  }),
+  unsaved,
+);
+
+console.log("client registration, transport, and history payload harness: pass");
