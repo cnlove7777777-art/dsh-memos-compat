@@ -79,8 +79,12 @@ export class DshRemoteMemory {
   expectedProfileId(): string | undefined { return this.pairedProfile; }
   snapshot(): RemoteStatus {
     const reverseNode = this.relay.peer();
-    return { ...this.status, ...(!this.route && reverseNode ? { state: "connected" as const, route: "wan" as const, nodeId: reverseNode } : {}),
-      ...(this.options.sync ? { sync: { ...this.options.sync.stats(), ...this.syncStatus } } : {}) };
+    const stats = this.options.sync?.stats();
+    const count = stats ? Object.values(stats.replicas).reduce((sum, value) => sum + value, 0) : 0;
+    return { ...this.status, ...(!this.route && reverseNode ? { state: "connected" as const, route: this.relay.route(), nodeId: reverseNode } : {}),
+      ...(!this.status.lastError && this.syncStatus.lastError ? { lastError: this.syncStatus.lastError } : {}),
+      ...(stats ? { sync: { ...stats, ...this.syncStatus, synced: count,
+        state: this.syncStatus.lastError ? "error" : this.syncStatus.lastRunAt || count ? "synced" : "idle" } } : {}) };
   }
   async acceptPeer(node: string, profileId?: unknown): Promise<void> {
     if (!validNodeId(node) || node === this.nodeId() || this.expectedNodeId() && this.expectedNodeId() !== node) throw new Error("Unexpected peer identity");
@@ -194,7 +198,10 @@ export class DshRemoteMemory {
       if (this.options.config().syncEnabled && this.options.sync && this.options.embedQuery) {
         try { vector = await this.options.embedQuery(query.query, signal, query.deadlineAt); } catch { /* Lexical recall remains available. */ }
       }
-      const hits = this.options.config().syncEnabled ? await this.options.sync?.search(query.query, 10, vector) : undefined;
+      const store = this.options.config().syncEnabled ? this.options.sync : undefined;
+      let hits: ReturnType<PeerSyncStore["search"]> | undefined = undefined;
+      try { hits = store?.search(query.query, 10, vector, { replicasOnly: true }); }
+      catch { hits = store?.search(query.query, 10, undefined, { replicasOnly: true }); }
       if (!hits?.length) throw error;
       return { query, hits, injectedContext: "[Offline peer replica; verify source and date]\n" + hits.map(hit => hit.snippet).join("\n"),
         tierLatencyMs: { tier1: 0, tier2: 0, tier3: 0 } };

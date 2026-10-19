@@ -11,11 +11,12 @@ interface Pending {
 export class PeerRelay {
   private pending = new Map<string, Pending>();
   private waiter?: { node: string; resolve(value: RelayCommand[]): void; timer: ReturnType<typeof setTimeout> };
-  private lastPeer?: { node: string; seenAt: number };
+  private lastPeer?: { node: string; seenAt: number; route: "lan" | "wan" };
 
   peer(): string | undefined {
     return this.lastPeer && Date.now() - this.lastPeer.seenAt < 30_000 ? this.lastPeer.node : undefined;
   }
+  route(): "lan" | "wan" | undefined { return this.peer() ? this.lastPeer?.route : undefined; }
 
   async request(kind: RelayCommand["kind"], value: unknown, signal?: AbortSignal): Promise<unknown> {
     const node = this.peer();
@@ -39,8 +40,8 @@ export class PeerRelay {
     });
   }
 
-  async poll(node: string): Promise<RelayCommand[]> {
-    this.lastPeer = { node, seenAt: Date.now() };
+  async poll(node: string, route: "lan" | "wan" = "wan"): Promise<RelayCommand[]> {
+    this.lastPeer = { node, seenAt: Date.now(), route };
     if (this.waiter) { clearTimeout(this.waiter.timer); this.waiter.resolve([]); this.waiter = undefined; }
     const commands = this.take(node);
     if (commands.length) return commands;

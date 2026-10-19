@@ -45,17 +45,18 @@ changes still follow the Viewer's existing restart instructions.
 
 ## Install
 
-From a DSH profile directory:
+From a DSH profile directory, the GitHub default branch can be installed with:
 
 ```sh
 dsh plugin --profile <name> add cnlove7777777-art/dsh-memos-compat
 ```
 
-or from a packed tarball:
+For the `2.0.16-dsh.6` candidate on `feat/dsh-peer-network-20261019`, build
+and install its tarball. The GitHub default branch may contain an older version:
 
 ```sh
 npm pack
-dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.5.tgz
+dsh plugin --profile <name> add ./memtensor-memos-local-plugin-2.0.16-dsh.6.tgz
 ```
 
 DSH's plugin manager owns dependency installation and bundle registration.
@@ -170,13 +171,10 @@ or uploading raw session archives. A DSH-only server needs no Codex reader.
 See the [peer transport contract](docs/DSH-PEER-NETWORK.md) for authentication,
 settings, synchronization and live acceptance boundaries.
 
-An optional existing SSH settings file (`identity`, `known_hosts`,
-`last_address`, optional `username`) lets the plugin own the paired transport.
-It preserves host-key checking and never scans the network. The SSH child is
-only transport and stops with the plugin; no OS task or memory daemon is added.
-The paired NanoPi transport uses local forward 18794 -> server 18801 and reverse
-forward server 18793 -> this Viewer's port. Disable the old standalone connector
-before handing these ports to the plugin.
+Upgrades from v5 migrate legacy SSH URLs to LAN discovery and copy any
+market-owned pairing key into plugin-owned credentials. The v6 runtime discards
+SSH tunnel settings. Verify the migrated credentials and a real peer connection
+before removing an older standalone connector.
 
 ## Known limits
 
@@ -186,10 +184,11 @@ before handing these ports to the plugin.
 - `unsafeMode()` is a no-op under `node:sqlite`, which does not enable
   `SQLITE_DBCONFIG_DEFENSIVE` — so `PRAGMA writable_schema` is already
   permitted and the migrations that need it still run.
-- Remote access currently provides federated read-only recall; bidirectional
-  database replication, remote writes and conflict/deletion merging are not
-  implemented. Source files exceeding the bounded reader limits need separate
-  handling; the worker never performs an unbounded whole-history import. See
+- Peer recall reads the source database; optional synchronization writes only
+  source-owned logical replicas into a separate store. Editing the remote source,
+  copying physical databases, and conflict/deletion merging are not implemented.
+  Source files exceeding the bounded reader limits need separate handling; the
+  worker never performs an unbounded whole-history import. See
   [the delivery boundaries](docs/DSH-MEMORY-PLAN.md).
 
 ## Upstream

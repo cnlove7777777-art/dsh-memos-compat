@@ -119,7 +119,7 @@ export function createMemoryPeerHandler(options: {
       if (url.pathname.startsWith("/peer/relay/") || url.pathname.startsWith("/peer/sync/")) {
         if (!signedNode || !options.remote) { json(res, 403, { error: "Signed pairing required" }); return; }
         await options.remote.acceptPeer(signedNode);
-        if (url.pathname === "/peer/relay/poll") { json(res, 200, { commands: await options.remote.relay.poll(signedNode) }); return; }
+        if (url.pathname === "/peer/relay/poll") { json(res, 200, { commands: await options.remote.relay.poll(signedNode, loopback ? "wan" : "lan") }); return; }
         if (url.pathname === "/peer/relay/results") { options.remote.relay.results(signedNode, body.results); json(res, 200, { ok: true }); return; }
         const store = options.sync?.();
         if (!config.syncEnabled || !store) { json(res, 403, { error: "Synchronization disabled" }); return; }

@@ -115,6 +115,16 @@ describe("peer protocol and credential boundaries", () => {
       }) as never });
     await expect(client.search(query)).rejects.toThrow("Peer response authentication failed");
   });
+  it("backs off rejected authentication but allows an explicit connection test", async () => {
+    const { tokenFile } = await home(); const fetchMock = vi.fn(async () => new Response("{}", { status: 401 }));
+    const remote = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true, nodeId: "desktop",
+      url: "https://example.test", tokenFile, lanDiscovery: false }), fetch: fetchMock as never });
+    cleanups.push(() => remote.stop()); await remote.start(); await remote.connect();
+    const automatic = fetchMock.mock.calls.length; await remote.connect(false);
+    expect(fetchMock).toHaveBeenCalledTimes(automatic);
+    await remote.connect(); expect(fetchMock).toHaveBeenCalledTimes(automatic + 1);
+    expect(remote.snapshot()).toMatchObject({ state: "offline", lastError: expect.stringMatching(/session or pairing key/i) });
+  });
 });
 
 describe("real HTTP peer routes", () => {
@@ -175,7 +185,8 @@ describe("real HTTP peer routes", () => {
 
 describe("reverse queue", () => {
   it("restricts results to their authenticated peer and cancels on shutdown", async () => {
-    const relay = new PeerRelay(); const poll = relay.poll("desktop");
+    const relay = new PeerRelay(); const poll = relay.poll("desktop", "lan");
+    expect(relay.route()).toBe("lan");
     const pending = relay.request("detail", { id: "trace" });
     const commands = await poll;
     relay.results("other", [{ id: commands[0].id, ok: true, value: "forged" }]);
