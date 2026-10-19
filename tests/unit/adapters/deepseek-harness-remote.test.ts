@@ -128,6 +128,21 @@ describe("peer protocol and credential boundaries", () => {
 });
 
 describe("real HTTP peer routes", () => {
+  it("recalls immediately after correcting credentials and explicitly reconnecting", async () => {
+    const peer = await paired(); await peer.desktop.stop();
+    const { tokenFile } = await home();
+    await writeFile(tokenFile, JSON.stringify({ token: "synthetic-wrong-pairing-key-abcdefghijklmnopqrstuvwxyz" }));
+    const remote = new DshRemoteMemory({ localPort: 18801, config: () => ({ enabled: true,
+      url: peer.endpoint.url, tokenFile, nodeId: "desktop", expectedNodeId: "server", lanDiscovery: false }) });
+    cleanups.push(() => remote.stop()); await remote.start();
+    expect((await remote.connect()).state).toBe("offline");
+    await expect(remote.search(query)).rejects.toThrow();
+
+    await writeFile(tokenFile, JSON.stringify({ token: key }));
+    expect((await remote.connect()).state).toBe("connected");
+    expect((await remote.search(query)).hits[0].refId).toBe("remote~tr-real");
+    expect(await remote.getTrace(trace.id)).toEqual(trace);
+  });
   it("prefers discovered LAN and falls back to the configured gateway when LAN fails", async () => {
     const peer = await paired(); const { tokenFile } = await home(); let failLan = false;
     const calls: string[] = [];

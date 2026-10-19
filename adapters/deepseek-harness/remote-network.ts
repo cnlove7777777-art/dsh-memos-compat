@@ -165,6 +165,7 @@ export class DshRemoteMemory {
           !timingSafeEqual(Buffer.from(response.proof, "hex"), Buffer.from(handshakeProof(key, challenge, response.node_id), "hex"))) throw new Error("Peer handshake failed");
         await this.acceptPeer(response.node_id, response.profile_id);
         if (this.stopped || generation !== this.generation) return this.snapshot();
+        this.authRetryAfter.delete(candidate.url);
         this.route = { ...candidate, nodeId: response.node_id, connectedAt: Date.now() };
         this.status = { state: "connected", route: candidate.kind, url: candidate.url, nodeId: response.node_id, lastConnectedAt: Date.now() };
         await this.persist(); this.startRelay();
