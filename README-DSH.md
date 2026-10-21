@@ -213,6 +213,25 @@ snapshots are available at DSH `/api/memos/activity` and Viewer
 blocking memory work. Summary excerpts appear only after generation and import
 succeed; merely receiving a peer summary does not count as local generation.
 
+## Idle storage writes (`2.0.16-dsh.10`)
+
+Activity changes are coalesced for up to 250 ms. New or updated memories,
+model activity, and sync route/outcome changes trigger persistence. Repeated
+unchanged sync pages update the live counters in memory, with one final
+checkpoint on graceful shutdown. A crash can lose those trailing idle counters;
+it does not remove committed memories. Reading Settings does not itself persist
+idle counters.
+
+Peer identities and routes persist only when they change. Heartbeat timestamps
+stay in memory; cursor-only progress through unchanged pages is checkpointed on
+graceful shutdown or an actual import. An abrupt restart can replay pages, which
+the existing content-based import deduplicates. Discovery and synchronization
+keep their existing intervals and authenticated protocol.
+
+Embedding repair uses SQL counts to return immediately when no vectors are
+missing or have the wrong dimension. This skips full-row/vector enumeration;
+explicit rebuild and repair of incomplete memories retain their existing paths.
+
 ## Known limits
 
 - `iterate()` is materialized: `node:sqlite` exposes no streaming cursor in

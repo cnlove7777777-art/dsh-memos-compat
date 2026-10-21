@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
-import { mkdtemp, writeFile, rm, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DshRemoteMemory, readPeerToken } from "../../../adapters/deepseek-harness/remote.js";
 import { createMemoryPeerHandler } from "../../../adapters/deepseek-harness/shared-memory.js";
@@ -146,6 +146,23 @@ describe("peer protocol and credential boundaries", () => {
 });
 
 describe("real HTTP peer routes", () => {
+  it("does not rewrite unchanged routes during reconnect or restart discovery", async () => {
+    const { desktop, tokenFile } = await paired();
+    const stateFile = join(dirname(tokenFile), "desktop", "peer-network.json");
+    const before = await stat(stateFile, { bigint: true });
+    const body = await readFile(stateFile, "utf8");
+    await desktop.connect();
+    await desktop.connect();
+    expect(await stat(stateFile, { bigint: true })).toMatchObject({ ino: before.ino, mtimeNs: before.mtimeNs });
+    expect(await readFile(stateFile, "utf8")).toBe(body);
+    await desktop.stop();
+    const afterStop = await stat(stateFile, { bigint: true });
+    await desktop.initialize();
+    await desktop.start();
+    await desktop.connect();
+    expect(await stat(stateFile, { bigint: true })).toMatchObject({ ino: afterStop.ino, mtimeNs: afterStop.mtimeNs });
+  });
+
   it("recalls immediately after correcting credentials and explicitly reconnecting", async () => {
     const peer = await paired(); await peer.desktop.stop();
     const { tokenFile } = await home();

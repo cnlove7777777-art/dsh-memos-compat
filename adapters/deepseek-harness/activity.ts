@@ -11,6 +11,7 @@ export const ACTIVITY_MAX_MODEL_RECORDS = 64;
 export const ACTIVITY_MAX_SUMMARIES = 32;
 export const ACTIVITY_MAX_SUMMARY_CHARS = 280;
 export const ACTIVITY_MAX_FILE_BYTES = 256 * 1024;
+export const ACTIVITY_SAVE_DELAY_MS = 250;
 
 export type ActivitySyncOperation =
   | "pull"
@@ -388,6 +389,11 @@ export class DshActivityLedger {
   private writes: Promise<void> = Promise.resolve();
   private persistenceWarning?: string;
   private sessionTotals = freshTotals();
+  private saveTimer?: ReturnType<typeof setTimeout>;
+  private saveRequested = false;
+  private changed = false;
+  private lastSavedBody?: string;
+  private syncStates = new Map<string, string>();
 
   constructor(private readonly home: string) {
     this.path = join(home, ACTIVITY_FILE_NAME);
@@ -452,6 +458,9 @@ export class DshActivityLedger {
         recentModels,
         recentSummaries,
       };
+      this.lastSavedBody = JSON.stringify(this.persisted) + "\n";
+      this.syncStates.clear();
+      for (const record of recentSync) this.rememberSyncState(record);
       this.persistenceWarning = undefined;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | null)?.code;
@@ -476,6 +485,8 @@ export class DshActivityLedger {
       errorCode: input.errorCode,
     });
     if (!record) return;
+    this.changed = true;
+    const transition = this.rememberSyncState(record);
     const totals = this.persisted.totals.sync;
     totals.attempts++;
     totals.lastAttemptAt = record.at;
@@ -505,7 +516,11 @@ export class DshActivityLedger {
       [...this.persisted.recentSync, record],
       ACTIVITY_MAX_SYNC_RECORDS,
     );
-    this.queuePersist();
+    // Unchanged pages update live counters without rewriting the full ledger.
+    // A graceful shutdown checkpoints these counters once.
+    if (transition || record.outcome === "success" && (record.inserted > 0 || record.updated > 0) || this.persistenceWarning) {
+      this.queuePersist();
+    }
   }
 
   beginModel(input: ModelActivityInput): { finish(result: ModelActivityResult): void } {
@@ -520,6 +535,7 @@ export class DshActivityLedger {
     });
     let settled = false;
     if (record) {
+      this.changed = true;
       this.persisted.totals.model.requests++;
       this.persisted.totals.model.pending++;
       this.persisted.totals.model.lastRequestAt = at;
@@ -579,6 +595,7 @@ export class DshActivityLedger {
       summary: input.summary,
     });
     if (!record) return;
+    this.changed = true;
     this.persisted.totals.summaries++;
     this.sessionTotals.summaries++;
     this.persisted.recentSummaries = trimRecords(
@@ -602,7 +619,7 @@ export class DshActivityLedger {
       },
       definition: {
         modelRequest: "插件实际发起的一次 DSH 文字模型流请求",
-        syncCounts: "发送/接收为本机成功发送或处理同步页的逻辑条目；服务端处理不代表客户端已确认收到；新增、更新、未变分别计数",
+        syncCounts: "发送/接收为本机成功发送或处理同步页的逻辑条目；服务端处理不代表客户端已确认收到；新增、更新、未变分别计数。未变同步统计实时累计，正常退出保存；异常中断可能丢失尾部统计。",
         providerRetries: "provider 内部重试不可由插件观测，不计入请求次数",
       },
       totals: this.persisted.totals,
@@ -618,16 +635,43 @@ export class DshActivityLedger {
   }
 
   async flush(): Promise<void> {
+    clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    if (this.saveRequested) this.persistPending();
     await this.writes.catch(() => undefined);
   }
 
   async close(): Promise<void> {
+    if (this.changed) this.queuePersist();
     await this.flush();
   }
 
+  private rememberSyncState(record: SyncActivityRecord): boolean {
+    const key = JSON.stringify([record.peer ?? "", record.operation]);
+    const state = JSON.stringify([record.route, record.outcome, record.errorCode ?? ""]);
+    const previous = this.syncStates.get(key);
+    this.syncStates.set(key, state);
+    if (this.syncStates.size > ACTIVITY_MAX_SYNC_RECORDS) {
+      this.syncStates.delete(this.syncStates.keys().next().value!);
+    }
+    return previous !== state;
+  }
+
   private queuePersist(): void {
+    this.saveRequested = true;
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      this.persistPending();
+    }, ACTIVITY_SAVE_DELAY_MS);
+    this.saveTimer.unref();
+  }
+
+  private persistPending(): void {
+    this.saveRequested = false;
     this.writes = this.writes.catch(() => undefined).then(async () => {
       const body = JSON.stringify(this.persisted) + "\n";
+      if (body === this.lastSavedBody) return;
       if (Buffer.byteLength(body, "utf8") > ACTIVITY_MAX_FILE_BYTES) {
         this.persistenceWarning = "activity_file_limit_exceeded";
         throw new Error("Activity file limit exceeded");
@@ -637,6 +681,7 @@ export class DshActivityLedger {
         this.persistenceWarning = undefined;
         await fs.writeFile(temporary, body, { mode: 0o600 });
         await fs.rename(temporary, this.path);
+        this.lastSavedBody = body;
         this.persistenceWarning = undefined;
       } catch {
         this.persistenceWarning = "activity_write_failed";

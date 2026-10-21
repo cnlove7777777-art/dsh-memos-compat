@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { makeTmpDb, type TmpDbHandle } from "../../helpers/tmp-db.js";
@@ -36,7 +36,7 @@ it("synchronizes different DSH profiles bidirectionally and recalls a persisted 
   await serverActivity.load();
   desktopStore.open(); serverStore.open(); cleanups.push(() => desktopStore.close()); cleanups.push(() => serverStore.close());
   const serverConfig: MemoryRemoteConfig = { enabled: true, tokenFile: credential, url: "", lanDiscovery: false, syncEnabled: true, nodeId: "server", expectedNodeId: "desktop" };
-  const server = new DshRemoteMemory({ config: () => serverConfig, localPort: 18801, profileId: "nanopi", sync: serverStore,
+  const server = new DshRemoteMemory({ config: () => serverConfig, localPort: 18801, home: serverDb.dir, profileId: "nanopi", sync: serverStore,
     activity: serverActivity });
   cleanups.push(() => server.stop());
   const handler = createMemoryPeerHandler({ core: {} as MemoryCore, config: () => serverConfig, profileId: "nanopi", remote: server,
@@ -48,7 +48,7 @@ it("synchronizes different DSH profiles bidirectionally and recalls a persisted 
   cleanups.push(close);
   const config: MemoryRemoteConfig = { enabled: true, tokenFile: credential, url: `http://127.0.0.1:${(listener.address() as { port: number }).port}`,
     lanDiscovery: false, syncEnabled: true, nodeId: "desktop", expectedNodeId: "server" };
-  const desktop = new DshRemoteMemory({ config: () => config, localPort: 18801, profileId: "desktop", sync: desktopStore,
+  const desktop = new DshRemoteMemory({ config: () => config, localPort: 18801, home: desktopDb.dir, profileId: "desktop", sync: desktopStore,
     embedQuery: async () => ({ model, values: [1, 0, 0] }), activity: desktopActivity });
   cleanups.push(() => desktop.stop()); await server.start(); await desktop.start(); await desktop.connect();
   expect(userAgents.length).toBeGreaterThan(0);
@@ -67,6 +67,16 @@ it("synchronizes different DSH profiles bidirectionally and recalls a persisted 
   expect(serverStore.stats()).toMatchObject({ replicas: { trace: 1 }, vectors: 1, sourceProfiles: ["desktop"] });
   expect(desktopStore.stats().sourceProfiles).toEqual(["nanopi"]);
   expect(desktopDb.repos.traces.count()).toBe(1); expect(serverDb.repos.traces.count()).toBe(1);
+  const stateFile = join(desktopDb.dir, "peer-network.json");
+  const idleState = await readFile(stateFile, "utf8");
+  const idleStat = await stat(stateFile, { bigint: true });
+  for (let i = 0; i < 3; i++) await desktop.connect();
+  expect(await readFile(stateFile, "utf8")).toBe(idleState);
+  expect(await stat(stateFile, { bigint: true })).toMatchObject({ ino: idleStat.ino, mtimeNs: idleStat.mtimeNs });
+  serverDb.db.prepare("UPDATE traces SET value = 0.8 WHERE id = 'trace-server'").run();
+  await desktop.connect();
+  expect(desktopStore.getTrace("trace-server", "server")?.value).toBe(.8);
+  expect(await readFile(stateFile, "utf8")).not.toBe(idleState);
   await desktop.connect(); expect(serverStore.stats().replicas.trace).toBe(1);
   await close(); desktopStore.close(); desktopStore.open();
   const recalled = await desktop.search({ agent: "deepseek-harness", query: "absent-lexical-term", deadlineAt: Date.now() + 2000 });

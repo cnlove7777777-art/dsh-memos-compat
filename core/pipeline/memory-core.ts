@@ -4662,6 +4662,14 @@ export function createMemoryCore(
       };
     }
 
+    // Healthy repair passes need only SQL counts, without hydrating all rows.
+    if (mode === "repair" && statsBefore.needsRepair === 0) {
+      return {
+        mode, processed: 0, updated: 0, failed: 0, offset, nextOffset: 0,
+        done: true, statsBefore, statsAfter: statsBefore,
+      };
+    }
+
     const allSlots = collectEmbeddingSlots();
     const targetSlots = mode === "rebuild"
       ? allSlots

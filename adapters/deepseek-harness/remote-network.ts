@@ -73,6 +73,9 @@ export class DshRemoteMemory {
   private cursor?: string;
   private pushCursor?: string;
   private writes: Promise<void> = Promise.resolve();
+  private rememberedRoute?: Pick<Route, "url" | "nodeId" | "kind">;
+  private savedIdentityState?: string;
+  private savedBody?: string;
   private syncStatus: { lastRunAt?: number; lastError?: string } = {};
   private authRetryAfter = new Map<string, number>();
   private readonly fetchImpl: typeof fetch;
@@ -149,7 +152,8 @@ export class DshRemoteMemory {
       const listener = this.listener; this.listener = undefined;
       await new Promise<void>(resolve => { listener.close(() => resolve()); listener.closeAllConnections(); });
     }
-    await this.relayTask?.catch(() => undefined); await this.connectTask?.catch(() => undefined); await this.writes.catch(() => undefined);
+    await this.relayTask?.catch(() => undefined); await this.connectTask?.catch(() => undefined);
+    await this.persist(true); await this.writes.catch(() => undefined);
     await this.transport.close();
     this.route = undefined; this.status = { state: "disabled" };
   }
@@ -301,9 +305,11 @@ export class DshRemoteMemory {
     const store = this.options.sync, route = this.route; if (!store || !route || this.stopped) return;
     const activityRoute: ActivityRoute = route.kind;
     let pulled: PeerSyncPage | undefined;
+    let changed = false;
     try {
       pulled = await this.requestAt(route.url, "/peer/sync/pull", { cursor: this.cursor, limit: 20 }, this.controller?.signal, 5000) as PeerSyncPage;
       const received = await store.importPage(pulled, route.nodeId, this.expectedProfileId());
+      changed = received.inserted > 0 || received.updated > 0;
       this.options.activity?.recordSync({
         operation: "pull",
         direction: "receive",
@@ -351,7 +357,9 @@ export class DshRemoteMemory {
       });
       throw error;
     }
-    this.pushCursor = push.nextCursor; await this.persist();
+    this.pushCursor = push.nextCursor;
+    // Cursor movement through unchanged pages can safely replay after a crash.
+    if (changed) await this.persist(true);
   }
   private async requestAt(base: string, route: string, value?: unknown, signal?: AbortSignal, timeout = 2800, method = "POST"): Promise<unknown> {
     const config = this.options.config(), target = peerUrl(base, route), body = value === undefined ? "" : JSON.stringify(value);
@@ -397,16 +405,39 @@ export class DshRemoteMemory {
         if (isPrivateAddress(remembered.hostname) && (!this.expectedNodeId() || this.expectedNodeId() === state.route.nodeId)) this.candidates.set(state.route.url, { nodeId: state.route.nodeId,
           url: state.route.url, lastSeenAt: Date.now() });
       }
+      this.rememberedRoute = undefined;
+      if ((state.route?.kind === "lan" || state.route?.kind === "wan") &&
+          validNodeId(state.route.nodeId) && (!this.expectedNodeId() || this.expectedNodeId() === state.route.nodeId)) {
+        peerBaseUrl(state.route.url); // Validate before retaining a durable route.
+        this.rememberedRoute = { url: state.route.url, nodeId: state.route.nodeId, kind: state.route.kind };
+      }
+      if (validNodeId(state.nodeId) && (!this.options.config().expectedNodeId ||
+          state.pairedNode === this.options.config().expectedNodeId)) {
+        const stable = this.identityState();
+        this.savedIdentityState = JSON.stringify(stable);
+        this.savedBody = JSON.stringify({ ...stable, cursor: this.cursor, pushCursor: this.pushCursor }) + "\n";
+      }
     } catch { /* First start has no remembered peer. */ }
     this.identity ||= `dsh-${randomUUID()}`; await this.persist();
   }
-  private async persist(): Promise<void> {
-    if (!this.options.home) return;
-    const state = { version: 1, nodeId: this.identity, pairedNode: this.pairedNode, pairedProfile: this.pairedProfile,
-      cursor: this.cursor, pushCursor: this.pushCursor, route: this.route };
+  private identityState() {
+    const route = this.route ?? this.rememberedRoute;
+    return { version: 1, nodeId: this.identity, pairedNode: this.pairedNode, pairedProfile: this.pairedProfile,
+      ...(route ? { route: { url: route.url, nodeId: route.nodeId, kind: route.kind } } : {}) };
+  }
+  private async persist(checkpoint = false): Promise<void> {
+    if (!this.options.home || !this.identity) return;
     this.writes = this.writes.catch(() => undefined).then(async () => {
+      const stable = this.identityState();
+      const identityState = JSON.stringify(stable);
+      if (!checkpoint && identityState === this.savedIdentityState) return;
+      const body = JSON.stringify({ ...stable, cursor: this.cursor, pushCursor: this.pushCursor }) + "\n";
+      if (body === this.savedBody) return;
       const target = join(this.options.home!, "peer-network.json"), temp = `${target}.${randomUUID()}.tmp`;
-      await writeFile(temp, JSON.stringify(state) + "\n", { mode: 0o600 }); await rename(temp, target);
+      await writeFile(temp, body, { mode: 0o600 }); await rename(temp, target);
+      this.savedIdentityState = identityState;
+      this.savedBody = body;
+      this.rememberedRoute = stable.route;
     });
     return this.writes;
   }

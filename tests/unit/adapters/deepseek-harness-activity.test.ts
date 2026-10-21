@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ACTIVITY_MAX_MODEL_RECORDS,
@@ -14,6 +15,7 @@ import {
 const homes: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const home of homes.splice(0)) {
     await rm(home, { recursive: true, force: true });
   }
@@ -26,6 +28,74 @@ async function tempHome(): Promise<string> {
 }
 
 describe("DSH activity ledger", () => {
+  it("coalesces changes, keeps idle polling read-only, and checkpoints totals on close", async () => {
+    const home = await tempHome();
+    const ledger = new DshActivityLedger(home);
+    await ledger.load();
+    const rename = vi.spyOn(fs, "rename");
+    const input = { operation: "pull" as const, direction: "receive" as const,
+      outcome: "success" as const, route: "lan" as const, peer: "server",
+      receivedItems: 20, skipped: 20 };
+    for (let i = 0; i < 6; i++) ledger.recordSync(input);
+    const model = ledger.beginModel({ provider: "host", model: "registered-model" });
+    model.finish({ outcome: "success" });
+    await ledger.flush();
+    expect(rename).toHaveBeenCalledTimes(1);
+    const path = join(home, "dsh-activity.json");
+    const durable = await readFile(path, "utf8");
+    ledger.recordSync(input);
+    expect((await ledger.snapshot()).totals.sync.attempts).toBe(7);
+    await ledger.flush();
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(await readFile(path, "utf8")).toBe(durable);
+    await ledger.close();
+    expect(rename).toHaveBeenCalledTimes(2);
+    const restored = new DshActivityLedger(home);
+    await restored.load();
+    restored.recordSync(input);
+    expect((await restored.snapshot()).totals.sync.attempts).toBe(8);
+    expect(rename).toHaveBeenCalledTimes(2);
+    await restored.close();
+    expect(rename).toHaveBeenCalledTimes(3);
+  });
+
+  it("persists failure, recovery, route changes and changed memory pages", async () => {
+    const home = await tempHome();
+    const ledger = new DshActivityLedger(home);
+    await ledger.load();
+    const input = { operation: "pull" as const, direction: "receive" as const,
+      outcome: "success" as const, route: "lan" as const, peer: "server" };
+    ledger.recordSync(input);
+    await ledger.flush();
+    const rename = vi.spyOn(fs, "rename");
+    ledger.recordSync({ ...input, outcome: "failure", errorCode: "timeout" });
+    await ledger.flush();
+    expect(rename).toHaveBeenCalledTimes(1);
+    ledger.recordSync({ ...input, outcome: "failure", errorCode: "timeout" });
+    await ledger.flush();
+    expect(rename).toHaveBeenCalledTimes(1);
+    ledger.recordSync(input);
+    await ledger.flush();
+    ledger.recordSync({ ...input, route: "wan" });
+    await ledger.flush();
+    ledger.recordSync({ ...input, route: "wan", inserted: 1 });
+    await ledger.flush();
+    expect(rename).toHaveBeenCalledTimes(4);
+    await ledger.close();
+  });
+
+  it("saves a model result after a bounded delay without a settings request", async () => {
+    const home = await tempHome();
+    const ledger = new DshActivityLedger(home);
+    await ledger.load();
+    ledger.beginModel({ provider: "host", model: "registered-model" }).finish({ outcome: "success" });
+    await vi.waitFor(async () => {
+      const body = JSON.parse(await readFile(join(home, "dsh-activity.json"), "utf8"));
+      expect(body.totals.model.successes).toBe(1);
+    }, { timeout: 2000 });
+    await ledger.close();
+  });
+
   it("counts only confirmed sync items while retaining failed attempts", async () => {
     const home = await tempHome();
     const ledger = new DshActivityLedger(home);

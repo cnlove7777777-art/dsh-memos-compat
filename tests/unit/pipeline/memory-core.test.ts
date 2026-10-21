@@ -312,6 +312,16 @@ describe("MemoryCore façade", () => {
     expect(fixed.statsAfter.dimMismatch).toBe(0);
     row = db!.repos.traces.getById("tr_imported" as never);
     expect(row?.vecSummary?.length).toBe(TEST_EMBED_DIMENSIONS);
+
+    const lists = [db!.repos.traces, db!.repos.policies, db!.repos.worldModel, db!.repos.skills]
+      .map(repo => vi.spyOn(repo, "list"));
+    const healthy = await core.rebuildEmbeddings({ mode: "repair", limit: 10 });
+    expect(healthy).toMatchObject({ processed: 0, updated: 0, failed: 0, done: true });
+    for (const list of lists) expect(list).not.toHaveBeenCalled();
+    const rebuilt = await core.rebuildEmbeddings({ mode: "rebuild", limit: 10 });
+    expect(rebuilt.updated).toBe(2);
+    expect(lists[0]).toHaveBeenCalled();
+    for (const list of lists) list.mockRestore();
   });
 
   it("repairs valid embedding slots while isolating a rejected neighbor", async () => {
